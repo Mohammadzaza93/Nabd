@@ -1,0 +1,92 @@
+# نبض — ملف إعدادات نموذجي (آمن للمشاركة في مستودع عام)
+# انسخه إلى config.yaml قبل التشغيل:  copy config.example.yaml config.yaml
+# أو استخدم: python nabd.py --setup   /   start-nabd.bat
+# يمكن إدارة كل الإعدادات لاحقاً من اللوحة العربية دون تعديل الملف.
+# ملاحظة أمنية: config.yaml و devices.csv مستبعدان من Git لأنهما قد يحملان
+# عناوين شبكتك الحقيقية وتوكن البوت. استخدم المتغيرات
+# NABD_TELEGRAM_TOKEN و NABD_DASH_PASSWORD و NABD_SMTP_PASSWORD للأسرار.
+
+telegram:
+  token: ""        # توكن البوت من BotFather (أو المتغير NABD_TELEGRAM_TOKEN)
+  chat_ids: []     # أرسل رسالة للبوت ثم: python nabd.py --chat-id
+
+# اختيار الإشعارات التي تُرسل إلى تيليجرام
+notifications:
+  device_down: true
+  device_up: true
+  internet: true
+  new_device: true
+  daily_report: true
+  port_down: true
+  high_cpu: true
+  sfp_low: true
+
+check_interval: 10     # فحص كل كم ثانية
+fail_threshold: 3      # عدد الفشل المتتالي قبل اعتبار الجهاز متوقفاً
+workers: 100           # عدد الفحوصات المتوازية
+events_retention_days: 30   # حذف الأحداث الأقدم من هذا العدد من الأيام
+
+dashboard:
+  host: "0.0.0.0"
+  port: 8080
+  password: ""   # فارغة = بدون كلمة مرور
+  live_seconds: 5      # تحديث الصفحة كل كم ثانية
+
+heartbeat_hour: 8      # ساعة التقرير اليومي (0-23)، null لإلغائه
+
+# مراقبة SNMP للسويتشات والراوترات ونقاط الوصول (v2c)
+snmp:
+  enabled: true
+  community: "public"   # يفضّل مجتمع قراءة فقط
+  port: 161
+  timeout: 1.5
+  retries: 1
+  poll_seconds: 60   # كل كم ثانية يُستعلم عن الأجهزة
+  history_points: 120   # عدد نقاط رسم الحركة في الذاكرة
+  cpu_warn: 85   # نسبة CPU التي تُطلق تنبيهاً
+  sfp_rx_min: -20.0   # حد إنذار ضعف استقبال SFP (dBm)
+  alert_cooldown_minutes: 30   # منع تكرار نفس التنبيه
+
+# السجل التاريخي والتقارير (SLA) — يُحفظ في nabd.db
+metrics:
+  enabled: true
+  sample_seconds: 60   # كل كم ثانية تُحفظ نقطة قياس لكل جهاز
+  keep_days: 30   # مدة الاحتفاظ بالقياسات
+
+# إشعارات البريد (SMTP) — تعمل إلى جانب تيليجرام
+email:
+  enabled: false
+  host: ""
+  port: 587
+  user: ""
+  password: ""   # أو المتغير NABD_SMTP_PASSWORD
+  from: ""   # بريد المرسل
+  to: []
+  tls: true   # STARTTLS عادة على المنفذ 587
+  ssl: false   # اتصال SSL مباشر عادة على المنفذ 465
+
+# إشعارات Webhook (JSON) — تعمل إلى جانب تيليجرام والبريد
+webhook:
+  enabled: false
+  url: ""
+  secret: ""
+  kinds: []   # فارغ = كل أنواع الإشعارات
+
+# الاكتشاف التلقائي للأجهزة من الراوتر المايكروتك (اختياري)
+discover:
+  router:
+    host: ""        # عنوان راوترك — اكتبه بنفسك
+    user: "nabd"
+    password: ""   # كلمة مرور مستخدم قراءة فقط
+    port: 8728
+  auto_minutes: 30.0                    # إعادة الاكتشاف كل كم دقيقة (0 = إيقاف)
+  exclude_interfaces: ["WAN-interface"]
+  only_interfaces: []                 # فارغ = كل الشبكات الداخلية
+  port_map: {}
+  new_group: "مكتشف"                  # مجموعة الأجهزة المكتشفة
+  max_new_per_run: 400
+
+# الفحص الذاتي من السيرفر (بدون إعداد على الراوتر): python nabd.py --scan
+scan:
+  subnets: []   # فارغ = يكتشف شبكات هذا الجهاز تلقائياً
+  auto_minutes: 0.0        # 0 = يدوي فقط

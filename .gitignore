@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+venv/
+.pytest_cache/
+*.tmp
+*.bak-*
+
+# بيانات وإعدادات خاصة بجهازك — لا ترفعها إلى مستودع عام
+config.yaml
+devices.csv
+.env
+.env.*
+
+# قاعدة بيانات التشغيل (تُنشأ تلقائياً)
+nabd.db
+nabd.db-shm
+nabd.db-wal

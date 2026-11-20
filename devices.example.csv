@@ -1,0 +1,10 @@
+name,ip,kind,parent,group,snmp,snmp_community,profile
+Router,192.168.1.1,router,,الراوتر,on,public,mikrotik
+ISP-Gateway,192.168.1.254,isp,Router,الإنترنت,,,
+Google-DNS,8.8.8.8,internet,Router,الإنترنت,,,
+SW1,192.168.1.2,switch,Router,السويتشات,on,public,mikrotik
+SW2,192.168.1.3,switch,SW1,السويتشات,on,public,generic
+AP1,192.168.1.4,wifi,SW1,نقاط الوصول,on,public,ubiquiti
+CAM1,192.168.1.101,camera,SW2,الكاميرات,,,
+DVR1,192.168.1.100,dvr,SW2,الكاميرات,,,
+SERVER1,192.168.1.10,server,SW1,السيرفرات,,,
