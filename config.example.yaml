@@ -90,3 +90,23 @@ discover:
 scan:
   subnets: []   # فارغ = يكتشف شبكات هذا الجهاز تلقائياً
   auto_minutes: 0.0        # 0 = يدوي فقط
+
+# قاعدة البيانات والنسخ الاحتياطي المحلي (مجاني بالكامل)
+database:
+  driver: sqlite   # sqlite (بلا تثبيت) أو postgres (مجاني مفتوح المصدر)
+  sqlite_path: "nabd.db"
+  postgres:
+    host: "127.0.0.1"
+    port: 5432
+    dbname: "nabd"
+    user: "nabd"
+    password: ""   # أو المتغير NABD_PG_PASSWORD — لا تكتبه في مستودع عام
+    sslmode: "disable"
+    bin_dir: ""    # مجلد pg_dump/psql عند استخدام النسخة المحمولة
+  backup:
+    enabled: true
+    dir: "backups"
+    interval_hours: 6     # نسخة تلقائية كل كم ساعة
+    keep_daily: 7
+    keep_weekly: 4
+    keep_monthly: 3

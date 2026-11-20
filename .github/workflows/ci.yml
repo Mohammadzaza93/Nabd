@@ -27,3 +27,6 @@ jobs:
 
       - name: SNMP client test (local fake agent)
         run: python tests/test_snmp.py
+
+      - name: Database and backup test
+        run: python tests/test_db.py

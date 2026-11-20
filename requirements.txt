@@ -3,3 +3,4 @@ requests>=2.31
 pyyaml>=6.0
 waitress>=3.0
 librouteros>=3.2
+psycopg[binary]>=3.1

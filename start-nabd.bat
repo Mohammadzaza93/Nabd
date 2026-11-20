@@ -24,6 +24,17 @@ if errorlevel 1 (
   )
 )
 
+rem تشغيل PostgreSQL المحمول تلقائياً إذا كان مضبوطاً في الإعدادات
+if "%NABD_PG_BIN%"=="" if exist "%LOCALAPPDATA%\nabd-pg\pgsql\bin\pg_ctl.exe" set "NABD_PG_BIN=%LOCALAPPDATA%\nabd-pg\pgsql\bin"
+if "%NABD_PG_DATA%"=="" if exist "%LOCALAPPDATA%\nabd-pg\data\PG_VERSION" set "NABD_PG_DATA=%LOCALAPPDATA%\nabd-pg\data"
+if defined NABD_PG_BIN if defined NABD_PG_DATA (
+  netstat -an | findstr ":5432 " >nul
+  if errorlevel 1 (
+    echo تشغيل خادم PostgreSQL المحلي...
+    "%NABD_PG_BIN%\pg_ctl.exe" -D "%NABD_PG_DATA%" -o "-p 5432 -h 127.0.0.1" -l "%LOCALAPPDATA%\nabd-pg\pg.log" start >nul
+  )
+)
+
 if not exist config.yaml (
   echo.
   echo لا يوجد ملف إعدادات بعد. سأشغّل الإعداد التفاعلي لإدخال عناوينك...

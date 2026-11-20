@@ -40,13 +40,15 @@ from urllib.parse import urlparse
 
 import requests
 import yaml
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, send_file
 
 try:
     from snmp import SNMPClient, SNMPError, SNMPTimeout, oid_under, to_int
+    from db import Database
 except ImportError:  # تشغيل nabd.py من مجلد آخر
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from snmp import SNMPClient, SNMPError, SNMPTimeout, oid_under, to_int
+    from db import Database
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -54,7 +56,7 @@ try:
 except Exception:
     pass
 
-VERSION = "2.5"
+VERSION = "2.6"
 BASE = os.environ.get("NABD_HOME") or os.path.dirname(os.path.abspath(__file__))
 IS_WIN = platform.system() == "Windows"
 DB = os.path.join(BASE, "nabd.db")
@@ -82,6 +84,7 @@ def _load_cfg():
 
 
 CFG = _load_cfg()
+DBM = Database(BASE, CFG.get("database") or {})
 
 
 def _as_int(value, default, minimum=0):
@@ -285,6 +288,29 @@ def _normalize_config(cfg):
     cfg["workers"] = _as_int(cfg.get("workers", 100), 100, 1)
     cfg["events_retention_days"] = _as_int(cfg.get("events_retention_days", 30), 30, 1)
     cfg["heartbeat_hour"] = _norm_hour(cfg.get("heartbeat_hour", 8))
+
+    dbc = cfg.get("database") or {}
+    cfg["database"] = dbc
+    dbc["driver"] = ("postgres" if str(dbc.get("driver") or "sqlite").lower()
+                     in ("postgres", "postgresql", "pg") else "sqlite")
+    dbc["sqlite_path"] = str(dbc.get("sqlite_path") or os.path.join(BASE, "nabd.db"))
+    pg = dbc.get("postgres") or {}
+    dbc["postgres"] = pg
+    pg["host"] = str(pg.get("host") or "127.0.0.1")
+    pg["port"] = _as_int(pg.get("port", 5432), 5432, 1)
+    pg["dbname"] = str(pg.get("dbname") or "nabd")
+    pg["user"] = str(pg.get("user") or "nabd")
+    pg["password"] = str(pg.get("password") or "")
+    pg["sslmode"] = str(pg.get("sslmode") or "disable")
+    pg["bin_dir"] = str(pg.get("bin_dir") or "")
+    bk = dbc.get("backup") or {}
+    dbc["backup"] = bk
+    bk["enabled"] = bool(bk.get("enabled", True))
+    bk["interval_hours"] = _as_int(bk.get("interval_hours", 6), 6, 1)
+    bk["keep_daily"] = _as_int(bk.get("keep_daily", 7), 7, 1)
+    bk["keep_weekly"] = _as_int(bk.get("keep_weekly", 4), 4, 0)
+    bk["keep_monthly"] = _as_int(bk.get("keep_monthly", 3), 3, 0)
+    bk["dir"] = str(bk.get("dir") or "backups")
     return cfg
 
 
@@ -294,6 +320,14 @@ def apply_runtime_config(cfg):
     global DASH_PW, DASH_HOST, DASH_PORT, LIVE_SECONDS, DISC, SCAN, _DR, DISC_ON, NOTIF
     global SNMP, SNMP_ON, EMAIL, METRICS, METRICS_ON, METRICS_STEP, METRICS_KEEP_DAYS, WEBHOOK
     cfg = _normalize_config(cfg)
+    bk = cfg["database"]["backup"]
+    DBM.backup_cfg.update({k: bk[k] for k in
+                           ("enabled", "interval_hours", "keep_daily",
+                            "keep_weekly", "keep_monthly")})
+    _bdir = str(bk.get("dir") or "backups")
+    DBM.backup_dir = (_bdir if os.path.isabs(_bdir)
+                      else os.path.join(BASE, _bdir))
+    DBM.backup_cfg["dir"] = _bdir
     tg = cfg["telegram"]
     TOKEN = os.environ.get("NABD_TELEGRAM_TOKEN", "").strip() or str(tg.get("token") or "").strip()
     CHATS = list(tg.get("chat_ids") or [])
@@ -402,25 +436,12 @@ def lan_ips():
 
 # ---------------------------------------------------------------- قاعدة البيانات
 def db_exec(sql, args=()):
-    c = sqlite3.connect(DB, timeout=15)
-    try:
-        c.execute("PRAGMA busy_timeout=8000")
-        cur = c.execute(sql, args)
-        rows = cur.fetchall()
-        c.commit()
-        return rows
-    finally:
-        c.close()
+    """ينفّذ استعلاماً على المحرك المضبوط (SQLite أو PostgreSQL)."""
+    return DBM.query(sql, args)
 
 
 def db_execmany(sql, rows):
-    c = sqlite3.connect(DB, timeout=15)
-    try:
-        c.execute("PRAGMA busy_timeout=8000")
-        c.executemany(sql, rows)
-        c.commit()
-    finally:
-        c.close()
+    return DBM.executemany(sql, rows)
 
 
 def prune_events():
@@ -444,20 +465,10 @@ def prune_samples():
 
 def init_db():
     try:
-        db_exec("PRAGMA journal_mode=WAL")
-        db_exec("CREATE TABLE IF NOT EXISTS events(ts REAL, name TEXT, ip TEXT, etype TEXT)")
-        db_exec("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
-        db_exec("""CREATE TABLE IF NOT EXISTS samples(
-            ts REAL NOT NULL, name TEXT NOT NULL, rtt REAL, cpu REAL, mem REAL,
-            in_bps REAL, out_bps REAL, ports_up INTEGER, ports_total INTEGER)""")
-        db_exec("CREATE INDEX IF NOT EXISTS idx_samples_name_ts ON samples(name, ts)")
-        db_exec("CREATE TABLE IF NOT EXISTS alert_acks(key TEXT PRIMARY KEY, name TEXT, at REAL)")
-        db_exec("CREATE TABLE IF NOT EXISTS maintenance(name TEXT PRIMARY KEY, until REAL)")
-        db_exec("""CREATE TABLE IF NOT EXISTS maintenance_log(
-            name TEXT, started REAL, ended REAL)""")
-        db_exec("CREATE INDEX IF NOT EXISTS idx_maint_log ON maintenance_log(name, started)")
+        DBM.init_schema()
         prune_events()
         prune_samples()
+        log(f"قاعدة البيانات: {DBM.driver} — {DBM.status().get('version', '')}")
     except Exception as e:
         log(f"تعذر تهيئة قاعدة البيانات: {e}")
 
@@ -666,7 +677,7 @@ def maintenance_until(name):
 
 def latest_maint_row(name):
     try:
-        rows = db_exec("SELECT rowid, started, ended FROM maintenance_log "
+        rows = db_exec("SELECT id, started, ended FROM maintenance_log "
                        "WHERE name=? ORDER BY started DESC LIMIT 1", (name,))
         return rows[0] if rows else None
     except Exception:
@@ -686,14 +697,14 @@ def set_maintenance(name, minutes):
         db_exec("DELETE FROM maintenance WHERE name=?", (name,))
         row = latest_maint_row(name)
         if row and (row[2] or 0) > now:
-            db_exec("UPDATE maintenance_log SET ended=? WHERE rowid=?",
+            db_exec("UPDATE maintenance_log SET ended=? WHERE id=?",
                     (max(now, row[1]), row[0]))
         return 0
     until = now + min(minutes, 60 * 24 * 60) * 60
     db_exec("INSERT OR REPLACE INTO maintenance VALUES (?,?)", (name, until))
     row = latest_maint_row(name) if old_until > now else None
     if row and (row[2] or 0) > now:
-        db_exec("UPDATE maintenance_log SET ended=? WHERE rowid=?", (until, row[0]))
+        db_exec("UPDATE maintenance_log SET ended=? WHERE id=?", (until, row[0]))
     else:
         db_exec("INSERT INTO maintenance_log(name, started, ended) VALUES (?,?,?)",
                 (name, now, until))
@@ -1406,6 +1417,10 @@ def monitor_loop():
                 prune_events()
                 prune_samples()
                 last_prune = today
+            try:
+                DBM.maybe_backup()
+            except Exception as e:
+                log(f"تعذر إنشاء نسخة احتياطية تلقائية: {e}")
             now = datetime.now()
             if HB_HOUR is not None and now.hour == HB_HOUR and last_hb != today:
                 last_hb = today
@@ -2875,6 +2890,123 @@ def api_email_test():
     return jsonify({"ok": True, "message": "أُرسلت الرسالة التجريبية"})
 
 
+# ---------------------------------------------------------------- قاعدة البيانات والنسخ الاحتياطي
+@app.route("/api/db/status")
+def api_db_status():
+    with CFG_LOCK:
+        dbcfg = copy.deepcopy(CFG.get("database") or {})
+    pgc = dict(dbcfg.get("postgres") or {})
+    pgc.pop("password", None)  # لا تُرسل كلمة المرور إلى المتصفح
+    return jsonify({"ok": True, "db": DBM.status(), "version": VERSION,
+                    "settings": {"driver": dbcfg.get("driver") or "sqlite",
+                                 "postgres": pgc,
+                                 "backup": dbcfg.get("backup") or {}}})
+
+
+@app.route("/api/db/backups")
+def api_db_backups():
+    return jsonify({"ok": True, "dir": DBM.backup_dir,
+                    "settings": dict(DBM.backup_cfg),
+                    "backups": DBM.list_backups()})
+
+
+@app.route("/api/db/backup", methods=["POST"])
+def api_db_backup_now():
+    guard = _write_guard()
+    if guard:
+        return guard
+    try:
+        r = DBM.create_backup("manual")
+        log_event(time.time(), "قاعدة البيانات", "", "backup")
+        return jsonify(r)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:300]}), 500
+
+
+@app.route("/api/db/settings", methods=["POST"])
+def api_db_settings():
+    guard = _write_guard()
+    if guard:
+        return guard
+    data = request.get_json(silent=True) or {}
+    with CFG_LOCK:
+        cfg = copy.deepcopy(CFG)
+    dbc = cfg.get("database") or {}
+    old_driver = str(dbc.get("driver") or "sqlite")
+    if "driver" in data:
+        dbc["driver"] = str(data.get("driver") or "sqlite")
+    pg = dbc.get("postgres") or {}
+    pg_in = data.get("postgres") or {}
+    for k in ("host", "dbname", "user", "password", "sslmode", "bin_dir"):
+        if k in pg_in:
+            pg[k] = str(pg_in.get(k) or "")
+    if "port" in pg_in:
+        pg["port"] = _as_int(pg_in.get("port"), 5432, 1)
+    dbc["postgres"] = pg
+    bk = dbc.get("backup") or {}
+    bk_in = data.get("backup") or {}
+    if "enabled" in bk_in:
+        bk["enabled"] = bool(bk_in.get("enabled"))
+    for k in ("interval_hours", "keep_daily", "keep_weekly", "keep_monthly"):
+        if k in bk_in:
+            bk[k] = _as_int(bk_in.get(k), bk.get(k, 1), 1 if k == "interval_hours" else 0)
+    if "dir" in bk_in:
+        bk["dir"] = str(bk_in.get("dir") or "backups")
+    dbc["backup"] = bk
+    cfg["database"] = dbc
+    try:
+        save_config_file(cfg)
+        apply_runtime_config(cfg)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:300]}), 500
+    new_driver = str(_normalize_config(cfg)["database"]["driver"])
+    return jsonify({"ok": True, "restart_required": new_driver != old_driver,
+                    "db": DBM.status()})
+
+
+@app.route("/api/db/migrate", methods=["POST"])
+def api_db_migrate():
+    guard = _write_guard()
+    if guard:
+        return guard
+    r = DBM.migrate_from_sqlite()
+    return jsonify(r), (200 if r.get("ok") else 400)
+
+
+@app.route("/api/db/backups/<name>/download")
+def api_db_backup_download(name):
+    if not re.match(r"^nabd-\d{8}-\d{6}-[a-z0-9_-]+\.(db|sql)\.gz$", name or ""):
+        return jsonify({"ok": False, "error": "اسم نسخة غير صالح"}), 400
+    path = os.path.join(DBM.backup_dir, name)
+    if not os.path.isfile(path):
+        return jsonify({"ok": False, "error": "النسخة غير موجودة"}), 404
+    return send_file(path, as_attachment=True, download_name=name,
+                     mimetype="application/gzip")
+
+
+@app.route("/api/db/backups/<name>", methods=["DELETE"])
+def api_db_backup_delete(name):
+    guard = _write_guard()
+    if guard:
+        return guard
+    if DBM.delete_backup(name):
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "النسخة غير موجودة"}), 404
+
+
+@app.route("/api/db/backups/<name>/restore", methods=["POST"])
+def api_db_backup_restore(name):
+    guard = _write_guard()
+    if guard:
+        return guard
+    try:
+        r = DBM.restore(name)
+        log_event(time.time(), "قاعدة البيانات", "", "restore")
+        return jsonify(r)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:300]}), 500
+
+
 @app.route("/healthz")
 def healthz():
     db_ok = True
@@ -3166,6 +3298,7 @@ background:#1f1a0d;border-radius:5px;padding:0 4px;vertical-align:middle}
     <button type="button" data-view="reports">📊 التقارير</button>
     <button type="button" data-view="alerts">🔔 التنبيهات <span id="alerts-badge" class="badge zero">0</span></button>
     <button type="button" data-view="events">📜 السجل</button>
+    <button type="button" data-view="db">🗄 البيانات</button>
   </nav>
 
   <section id="view-devices" class="view">
@@ -3330,7 +3463,57 @@ background:#1f1a0d;border-radius:5px;padding:0 4px;vertical-align:middle}
     </table></div>
   </section>
 
-  <div class="foot">نبض نسخة <span id="ver">2.5</span> · تحديث تلقائي كل <span id="intv">5</span> ثوانٍ</div>
+  <section id="view-db" class="view" hidden>
+    <div class="viewhead">
+      <h2>🗄 قاعدة البيانات والنسخ الاحتياطي</h2>
+      <span class="hint">محركان مجانيان بالكامل، ونسخ محلية تماماً بلا أي خدمة مدفوعة</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost mini" id="db-refresh">↻ تحديث</button>
+      <button type="button" class="btn mini" id="db-backup-now">＋ نسخة الآن</button>
+    </div>
+    <div class="cards" id="db-status-cards"></div>
+    <div class="msg" id="db-msg" hidden></div>
+    <div class="viewhead" style="margin-top:12px">
+      <h3 style="margin:0">الإعدادات</h3>
+      <span class="hint" id="db-dir-hint"></span>
+      <span class="spacer"></span>
+      <button type="button" class="btn mini" id="db-save">💾 حفظ</button>
+    </div>
+    <div class="bar">
+      <label>المحرك
+        <select id="db-driver">
+          <option value="sqlite">SQLite (ملف واحد)</option>
+          <option value="postgres">PostgreSQL</option>
+        </select>
+      </label>
+      <label>كل ساعة<input id="db-interval" type="number" min="1" max="720"></label>
+      <label>يومي<input id="db-keep-daily" type="number" min="1" max="365"></label>
+      <label>أسبوعي<input id="db-keep-weekly" type="number" min="0" max="52"></label>
+      <label>شهري<input id="db-keep-monthly" type="number" min="0" max="24"></label>
+      <label style="flex:1">مجلد النسخ<input id="db-dir" maxlength="160" placeholder="backups"></label>
+      <label><input type="checkbox" id="db-enabled"> تلقائي</label>
+    </div>
+    <div id="db-pg" class="bar" hidden>
+      <label>المضيف<input id="db-host" maxlength="120"></label>
+      <label>المنفذ<input id="db-port" type="number" min="1" max="65535"></label>
+      <label>القاعدة<input id="db-name" maxlength="64"></label>
+      <label>المستخدم<input id="db-user" maxlength="64"></label>
+      <label>كلمة المرور<input id="db-password" type="password" maxlength="128" autocomplete="new-password"></label>
+      <label style="flex:1">مسار bin<input id="db-bin" maxlength="200" placeholder="C:/.../bin"></label>
+    </div>
+    <div class="viewhead" style="margin-top:12px">
+      <h3 style="margin:0">النسخ المتاحة</h3>
+      <span class="hint" id="db-count"></span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost mini" id="db-migrate">⇪ استيراد من SQLite</button>
+    </div>
+    <div class="scroll"><table>
+      <thead><tr><th>الوقت</th><th>السبب</th><th>الحجم</th><th>التحقق</th><th>إجراءات</th></tr></thead>
+      <tbody id="db-tbody"></tbody>
+    </table></div>
+  </section>
+
+  <div class="foot">نبض نسخة <span id="ver">2.6</span> · تحديث تلقائي كل <span id="intv">5</span> ثوانٍ</div>
 </div>
 
 <dialog id="dlg" class="modal" aria-labelledby="dtitle">
@@ -3665,8 +3848,8 @@ const state = {q:"", group:"", filter:"all", sort:"status", paused:false,
                mapPos:{}, mapView:null, mapDragging:false, maintName:null,
                mapLayout:null, alerts:null, alertsAt:0, alertCounts:null,
                alertMaint:[], reportAt:0, mapQ:"", mapStatus:"all", mapGroup:"",
-              history:null, historyAt:0, historyRange:"24h", historyBusy:false};
-const VIEWS = ["devices", "map", "reports", "alerts", "events"];
+              history:null, historyAt:0, historyRange:"24h", historyBusy:false, db:null, dbAt:0};
+const VIEWS = ["devices", "map", "reports", "alerts", "events", "db"];
 
 function fmtDur(s){
   s = Math.max(0, Math.floor(Number(s) || 0));
@@ -3750,6 +3933,7 @@ function setView(v){
   if (v === "reports"){ if (!state.report) loadReports(); }
   else if (v === "alerts"){ if (!state.alerts) loadAlerts(); else renderAlerts(); }
   else if (v === "events"){ if (!state.history) loadHistory(); else renderHistory(); }
+  else if (v === "db"){ if (!state.db) loadDb(); else renderDb(); }
   else if (v === "map") renderMap();
 }
 
@@ -3953,13 +4137,14 @@ function render(){
   renderEvents(j);
   renderTalkers(j);
   updateAlertBadges(j.alerts);
+  if (state.view === "db" && Date.now() - (state.dbAt || 0) > 60000) loadDb();
   if (state.view === "map") renderMap();
   else if (state.view === "alerts" && Date.now() - (state.alertsAt || 0) > 15000) loadAlerts();
   else if (state.view === "events" && Date.now() - (state.historyAt || 0) > 30000) loadHistory();
   else if (state.view === "reports" && state.report &&
            Date.now() - (state.reportAt || 0) > 60000) loadReports();
   $("intv").textContent = j.live || j.interval || 5;
-  $("ver").textContent = j.version || "2.5";
+  $("ver").textContent = j.version || "2.6";
   $("authwarn").hidden = !!j.auth;
   document.title = (j.counts.down ? "(" + j.counts.down + ") " : "") + "نبض — مراقبة الشبكة";
 }
@@ -4142,6 +4327,138 @@ function postJSON(url, body){
     if (!r.ok || j.ok === false) throw new Error(j.error || ("HTTP " + r.status));
     return j;
   });
+}
+
+/* ---------------- قاعدة البيانات والنسخ الاحتياطي ---------------- */
+async function loadDb(){
+  try {
+    const [s, b] = await Promise.all([
+      fetch("/api/db/status", {cache:"no-store"}).then(r => r.json()),
+      fetch("/api/db/backups", {cache:"no-store"}).then(r => r.json())
+    ]);
+    state.db = {status:s, backups:b};
+    state.dbAt = Date.now();
+    renderDb();
+  } catch(e){ msg("db-msg", "تعذر جلب معلومات قاعدة البيانات: " + e.message, "err"); }
+}
+function renderDb(){
+  const d = state.db;
+  if (!d) return;
+  const st = d.status.db || {}, t = st.tables || {};
+  const stats = [
+    ["المحرك", st.driver === "postgres" ? "PostgreSQL" : "SQLite", st.connected ? "ok" : "bad"],
+    ["الحجم", fmtBytes(st.size_bytes), "neutral"],
+    ["الأحداث", t.events || 0, "neutral"],
+    ["القياسات", t.samples || 0, "neutral"],
+    ["النسخ", st.backup_count || 0, "ok"]
+  ];
+  $("db-status-cards").replaceChildren(...stats.map(([k, v, c]) => {
+    const el = mk("div", "card " + c);
+    el.append(mk("span", "k", k), mk("b", "", String(v)));
+    return el;
+  }));
+  const list = d.backups.backups || [];
+  $("db-count").textContent = "(" + list.length + " نسخة)";
+  const sc = d.status.settings || {}, cfg = sc.backup || {}, pgc = sc.postgres || {};
+  $("db-dir-hint").textContent = d.backups.dir || "";
+  $("db-enabled").checked = !!cfg.enabled;
+  $("db-interval").value = cfg.interval_hours || 6;
+  $("db-keep-daily").value = cfg.keep_daily || 7;
+  $("db-keep-weekly").value = cfg.keep_weekly || 0;
+  $("db-keep-monthly").value = cfg.keep_monthly || 0;
+  $("db-dir").value = cfg.dir || "backups";
+  $("db-driver").value = st.driver || "sqlite";
+  $("db-pg").hidden = st.driver !== "postgres";
+  $("db-host").value = pgc.host || "127.0.0.1";
+  $("db-port").value = pgc.port || 5432;
+  $("db-name").value = pgc.dbname || "nabd";
+  $("db-user").value = pgc.user || "nabd";
+  $("db-bin").value = pgc.bin_dir || "";
+  const frag = document.createDocumentFragment();
+  for (const b of list){
+    const tr = document.createElement("tr");
+    tr.appendChild(td(new Date(b.ts * 1000).toLocaleString("ar-SY"), "sub"));
+    tr.appendChild(td(b.reason || "—"));
+    tr.appendChild(td(fmtBytes(b.bytes), "sub"));
+    tr.appendChild(td(b.verified === true ? "✓ سليمة" :
+                      (b.verified === false ? "✗ تالفة" : "—"), "sub"));
+    const cell = document.createElement("td");
+    const dl = mk("a", "btn ghost mini", "⬇ تنزيل");
+    dl.href = "/api/db/backups/" + encodeURIComponent(b.name) + "/download";
+    cell.appendChild(dl);
+    const rest = mk("button", "btn ghost mini", "↺ استعادة");
+    rest.type = "button";
+    rest.addEventListener("click", () => dbRestore(b.name));
+    cell.appendChild(rest);
+    const del = mk("button", "btn ghost mini", "🗑");
+    del.type = "button";
+    del.addEventListener("click", () => dbDelete(b.name));
+    cell.appendChild(del);
+    tr.appendChild(cell);
+    frag.appendChild(tr);
+  }
+  $("db-tbody").replaceChildren(frag);
+}
+async function dbBackupNow(){
+  try {
+    const r = await postJSON("/api/db/backup", {});
+    msg("db-msg", "تم إنشاء النسخة: " + r.name, "ok");
+    state.db = null; loadDb();
+  } catch(e){ msg("db-msg", e.message, "err"); }
+}
+async function dbSave(){
+  const driver = $("db-driver").value;
+  const body = {driver:driver, backup:{
+    enabled:$("db-enabled").checked,
+    interval_hours:Number($("db-interval").value) || 6,
+    keep_daily:Number($("db-keep-daily").value) || 7,
+    keep_weekly:Number($("db-keep-weekly").value) || 0,
+    keep_monthly:Number($("db-keep-monthly").value) || 0,
+    dir:$("db-dir").value || "backups"
+  }};
+  if (driver === "postgres"){
+    body.postgres = {
+      host:$("db-host").value || "127.0.0.1",
+      port:Number($("db-port").value) || 5432,
+      dbname:$("db-name").value || "nabd",
+      user:$("db-user").value || "nabd",
+      bin_dir:$("db-bin").value || ""
+    };
+    if ($("db-password").value) body.postgres.password = $("db-password").value;
+  }
+  try {
+    const r = await postJSON("/api/db/settings", body);
+    $("db-password").value = "";
+    msg("db-msg", r.restart_required
+      ? "تم الحفظ — يلزم إعادة التشغيل لتفعيل تغيير المحرك."
+      : "تم حفظ الإعدادات.", "ok");
+    state.db = null; loadDb();
+  } catch(e){ msg("db-msg", e.message, "err"); }
+}
+async function dbDelete(name){
+  if (!window.confirm("حذف النسخة " + name + "؟")) return;
+  try {
+    const r = await fetch("/api/db/backups/" + encodeURIComponent(name), {method:"DELETE"});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.ok === false) throw new Error(j.error || "HTTP " + r.status);
+    state.db = null; loadDb();
+  } catch(e){ msg("db-msg", e.message, "err"); }
+}
+async function dbRestore(name){
+  if (!window.confirm("استعادة النسخة " + name + "؟ سيُنشأ نسخة أمان قبل الاستعادة.")) return;
+  try {
+    const r = await postJSON("/api/db/backups/" + encodeURIComponent(name) + "/restore", {});
+    msg("db-msg", "تمت الاستعادة. نسخة الأمان: " + (r.safety_backup || "—"), "ok");
+    state.db = null; loadDb();
+  } catch(e){ msg("db-msg", e.message, "err"); }
+}
+async function dbMigrate(){
+  if (!window.confirm("نقل بيانات nabd.db القديمة إلى PostgreSQL؟")) return;
+  try {
+    const r = await postJSON("/api/db/migrate", {});
+    msg("db-msg", "تم النقل: " + JSON.stringify(r.counts || {}), "ok");
+    state.db = null; loadDb();
+  } catch(e){ msg("db-msg", e.message, "err"); }
 }
 
 /* ---------------- الإعدادات ---------------- */
@@ -5103,6 +5420,13 @@ $("map-group").addEventListener("change", (e) => {
   renderMap();
 });
 $("ev-refresh").addEventListener("click", loadHistory);
+$("db-refresh").addEventListener("click", loadDb);
+$("db-backup-now").addEventListener("click", dbBackupNow);
+$("db-save").addEventListener("click", dbSave);
+$("db-migrate").addEventListener("click", dbMigrate);
+$("db-driver").addEventListener("change", () => {
+  $("db-pg").hidden = $("db-driver").value !== "postgres";
+});
 $("ev-q").addEventListener("change", loadHistory);
 $("ev-type").addEventListener("change", loadHistory);
 $("ev-name").addEventListener("change", loadHistory);
@@ -6121,6 +6445,8 @@ def render_config(cfg):
     cfg = _normalize_config(cfg)
     tg, d, disc, dr, scan = (cfg["telegram"], cfg["dashboard"], cfg["discover"],
                              cfg["discover"]["router"], cfg["scan"])
+    dbc = cfg["database"]
+    pg, bk = dbc["postgres"], dbc["backup"]
     nots = cfg["notifications"]
     chats = "[" + ", ".join(_yaml_str(x) for x in tg["chat_ids"]) + "]"
     subnets = "[" + ", ".join(_yaml_str(x) for x in scan["subnets"]) + "]"
@@ -6176,11 +6502,31 @@ def render_config(cfg):
         f"  sfp_rx_min: {cfg['snmp']['sfp_rx_min']}   # حد إنذار ضعف استقبال SFP (dBm)",
         f"  alert_cooldown_minutes: {cfg['snmp']['alert_cooldown_minutes']}   # منع تكرار نفس التنبيه",
         "",
-        "# السجل التاريخي والتقارير (SLA) — يُحفظ في nabd.db",
+        "# السجل التاريخي والتقارير (SLA) — تُحفظ في قاعدة البيانات المضبوطة",
         "metrics:",
         f"  enabled: {str(cfg['metrics']['enabled']).lower()}",
         f"  sample_seconds: {cfg['metrics']['sample_seconds']}   # كل كم ثانية تُحفظ نقطة قياس لكل جهاز",
         f"  keep_days: {cfg['metrics']['keep_days']}   # مدة الاحتفاظ بالقياسات",
+        "",
+        "# قاعدة البيانات والنسخ الاحتياطي المحلي المجاني",
+        "database:",
+        f"  driver: {dbc['driver']}   # sqlite أو postgres — تغييره يحتاج إعادة تشغيل",
+        f"  sqlite_path: {_yaml_str(dbc['sqlite_path'])}",
+        "  postgres:",
+        f"    host: {_yaml_str(pg['host'])}",
+        f"    port: {pg['port']}",
+        f"    dbname: {_yaml_str(pg['dbname'])}",
+        f"    user: {_yaml_str(pg['user'])}",
+        f"    password: {_yaml_str(pg['password'])}   # أو NABD_PG_PASSWORD",
+        f"    sslmode: {_yaml_str(pg['sslmode'])}",
+        f"    bin_dir: {_yaml_str(pg['bin_dir'])}   # مجلد pg_dump/psql (اختياري)",
+        "  backup:",
+        f"    enabled: {str(bk['enabled']).lower()}",
+        f"    dir: {_yaml_str(bk['dir'])}   # نسبي لمجلد نبض أو مسار مطلق",
+        f"    interval_hours: {bk['interval_hours']}   # نسخة تلقائية كل كم ساعة",
+        f"    keep_daily: {bk['keep_daily']}   # أحدث نسخة يتم الاحتفاظ بها",
+        f"    keep_weekly: {bk['keep_weekly']}   # نسخ أسبوعية إضافية",
+        f"    keep_monthly: {bk['keep_monthly']}   # نسخ شهرية إضافية",
         "",
         "# إشعارات Webhook (JSON) — تعمل إلى جانب تيليجرام والبريد",
         "webhook:",
