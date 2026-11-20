@@ -23,7 +23,7 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Syntax check
-        run: python -m py_compile nabd.py snmp.py discover.py
+        run: python -m py_compile nabd.py snmp.py db.py discover.py
 
       - name: SNMP client test (local fake agent)
         run: python tests/test_snmp.py

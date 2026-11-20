@@ -13,6 +13,9 @@ import yaml  # noqa: E402
 from db import Database  # noqa: E402
 
 CFG_PATH = os.path.join(ROOT, "config.yaml")
+# config.yaml مستبعد من Git لأسباب أمنية؛ في CI نستخدم النموذج الآمن.
+if not os.path.exists(CFG_PATH):
+    CFG_PATH = os.path.join(ROOT, "config.example.yaml")
 with open(CFG_PATH, encoding="utf-8") as f:
     cfg = yaml.safe_load(f) or {}
 

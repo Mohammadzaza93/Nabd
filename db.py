@@ -157,6 +157,8 @@ class Database:
         try:
             cur = c.execute(sql, args)
             if cur.description is None:  # CREATE / INSERT / UPDATE / DELETE
+                if self.driver == "sqlite":
+                    c.commit()
                 return []
             return [tuple(r) for r in cur.fetchall()]
         finally:
@@ -173,6 +175,8 @@ class Database:
         try:
             with c.cursor() as cur:
                 cur.executemany(sql, rows)
+            if self.driver == "sqlite":
+                c.commit()
             return len(rows)
         finally:
             c.close()
