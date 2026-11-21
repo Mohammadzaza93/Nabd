@@ -31,6 +31,8 @@ dashboard:
   port: 8080
   password: ""   # فارغة = بدون كلمة مرور
   live_seconds: 5      # تحديث الصفحة كل كم ثانية
+  auth_max_fails: 6       # محاولات دخول فاشلة قبل الحظر المؤقت
+  auth_block_seconds: 300 # مدة الحظر بالثواني
 
 heartbeat_hour: 8      # ساعة التقرير اليومي (0-23)، null لإلغائه
 
@@ -103,6 +105,10 @@ database:
     password: ""   # أو المتغير NABD_PG_PASSWORD — لا تكتبه في مستودع عام
     sslmode: "disable"
     bin_dir: ""    # مجلد pg_dump/psql عند استخدام النسخة المحمولة
+    watchdog: true        # إعادة تشغيل PostgreSQL تلقائياً عند التوقف
+    watchdog_seconds: 15  # فترة الفحص (5-600 ثانية)
+    data_dir: ""          # مجلد بيانات PG (اختياري — يُكتشف تلقائياً)
+    pool_size: 8          # الاتصالات المُعاد استخدامها (1-64)
   backup:
     enabled: true
     dir: "backups"

@@ -10,6 +10,7 @@ ping دوري + تبعيات الأجهزة + إشعارات تيليجرام + 
 اكتشاف من الراوتر: python nabd.py --discover
 فحص ذاتي:       python nabd.py --scan
 رسالة تجريبية:  python nabd.py --test
+تقرير قاعدة البيانات: python nabd.py --db-health
 """
 import copy
 import csv
@@ -135,6 +136,12 @@ DASH_PW = os.environ.get("NABD_DASH_PASSWORD", "") or str(DASH.get("password") o
 DASH_HOST = str(DASH.get("host") or "0.0.0.0")
 DASH_PORT = _as_int(DASH.get("port", 8080), 8080, 1)
 LIVE_SECONDS = _as_int(DASH.get("live_seconds", 5), 5, 2)
+# حماية اللوحة من تخمين كلمة المرور: حظر مؤقت لكل عنوان IP بعد محاولات فاشلة
+AUTH_MAX_FAILS = _as_int(DASH.get("auth_max_fails", 6), 6, 3)
+AUTH_BLOCK_SECONDS = _as_int(DASH.get("auth_block_seconds", 300), 300, 30)
+AUTH_WINDOW_SECONDS = 600
+AUTH_FAILS = {}          # ip -> {"until": float, "times": deque}
+AUTH_FAIL_LOCK = threading.Lock()
 
 DISC = CFG.get("discover") or {}
 SCAN = CFG.get("scan") or {}
@@ -216,6 +223,8 @@ def _normalize_config(cfg):
     dash["port"] = _as_int(dash.get("port", 8080), 8080, 1)
     dash["password"] = str(dash.get("password") or "")
     dash["live_seconds"] = _as_int(dash.get("live_seconds", 5), 5, 2)
+    dash["auth_max_fails"] = _as_int(dash.get("auth_max_fails", 6), 6, 3)
+    dash["auth_block_seconds"] = _as_int(dash.get("auth_block_seconds", 300), 300, 30)
 
     disc = cfg.get("discover") or {}
     cfg["discover"] = disc
@@ -309,6 +318,7 @@ def _normalize_config(cfg):
     pg["watchdog_seconds"] = _as_int(pg.get("watchdog_seconds", 15), 15, 5)
     pg["data_dir"] = str(pg.get("data_dir") or "")
     pg["log_file"] = str(pg.get("log_file") or "")
+    pg["pool_size"] = _as_int(pg.get("pool_size", 8), 8, 1)
     bk = dbc.get("backup") or {}
     dbc["backup"] = bk
     bk["enabled"] = bool(bk.get("enabled", True))
@@ -324,6 +334,7 @@ def apply_runtime_config(cfg):
     """يطبّق الإعدادات فوراً على العاملين في الخلفية دون إعادة تشغيل."""
     global TOKEN, CHATS, TOKEN_OK, TG_ON, INTERVAL, THRESH, WORKERS, EVENTS_KEEP_DAYS, HB_HOUR
     global DASH_PW, DASH_HOST, DASH_PORT, LIVE_SECONDS, DISC, SCAN, _DR, DISC_ON, NOTIF
+    global AUTH_MAX_FAILS, AUTH_BLOCK_SECONDS
     global SNMP, SNMP_ON, EMAIL, METRICS, METRICS_ON, METRICS_STEP, METRICS_KEEP_DAYS, WEBHOOK
     cfg = _normalize_config(cfg)
     bk = cfg["database"]["backup"]
@@ -340,6 +351,7 @@ def apply_runtime_config(cfg):
     DBM.watchdog["data_dir"] = str(pg.get("data_dir") or
                                    os.environ.get("NABD_PG_DATA") or "")
     DBM.watchdog["log_file"] = str(pg.get("log_file") or "")
+    DBM.set_pool_size(pg.get("pool_size", 8))
     tg = cfg["telegram"]
     TOKEN = os.environ.get("NABD_TELEGRAM_TOKEN", "").strip() or str(tg.get("token") or "").strip()
     CHATS = list(tg.get("chat_ids") or [])
@@ -354,6 +366,10 @@ def apply_runtime_config(cfg):
     DASH_PW = os.environ.get("NABD_DASH_PASSWORD", "") or str(dash.get("password") or "")
     DASH_HOST = str(dash.get("host") or "0.0.0.0")
     DASH_PORT = _as_int(dash.get("port", 8080), 8080, 1)
+    AUTH_MAX_FAILS = _as_int(dash.get("auth_max_fails", 6), 6, 3)
+    AUTH_BLOCK_SECONDS = _as_int(dash.get("auth_block_seconds", 300), 300, 30)
+    with AUTH_FAIL_LOCK:
+        AUTH_FAILS.clear()
     LIVE_SECONDS = _as_int(dash.get("live_seconds", 5), 5, 2)
     DISC = cfg["discover"]
     SCAN = cfg["scan"]
@@ -2087,15 +2103,51 @@ except Exception:
     pass
 
 
+def _rate_limit_reply(rec):
+    """استجابة الحظر المؤقت مع ترويسة Retry-After."""
+    left = max(1, int(rec["until"] - time.time()))
+    return Response("محاولات دخول كثيرة — حاول بعد قليل", 429,
+                    {"Retry-After": str(left)})
+
+
 @app.before_request
 def _auth():
     if request.endpoint in ("healthz", "favicon"):
         return None
     if not DASH_PW:
         return None
+    ip = request.remote_addr or "-"
+    now = time.time()
+    with AUTH_FAIL_LOCK:
+        # تنظيف خفيف لذاكرة العناوين القديمة
+        if len(AUTH_FAILS) > 500:
+            for k in list(AUTH_FAILS):
+                v = AUTH_FAILS[k]
+                if v["until"] <= now and (not v["times"] or
+                                          now - v["times"][-1] > AUTH_WINDOW_SECONDS):
+                    AUTH_FAILS.pop(k, None)
+        rec = AUTH_FAILS.get(ip)
+        if rec and rec["until"] > now:
+            return _rate_limit_reply(rec)
+
     a = request.authorization
     if not a or not hmac.compare_digest(str(a.password or ""), DASH_PW):
+        with AUTH_FAIL_LOCK:
+            rec = AUTH_FAILS.setdefault(ip, {"until": 0.0, "times": deque()})
+            times = rec["times"]
+            times.append(now)
+            while times and now - times[0] > AUTH_WINDOW_SECONDS:
+                times.popleft()
+            blocked = len(times) >= AUTH_MAX_FAILS
+            if blocked:
+                rec["until"] = now + AUTH_BLOCK_SECONDS
+                times.clear()
+                log(f"حظر مؤقت للعنوان {ip} — محاولات دخول فاشلة متكررة")
+        if blocked:
+            return _rate_limit_reply(rec)
         return Response("مطلوب كلمة المرور", 401, {"WWW-Authenticate": 'Basic realm="Nabd"'})
+    with AUTH_FAIL_LOCK:
+        AUTH_FAILS.pop(ip, None)
     return None
 
 
@@ -2402,6 +2454,8 @@ def api_settings():
                 "has_password": bool(DASH_PW),
                 "password_from_env": bool(os.environ.get("NABD_DASH_PASSWORD", "")),
                 "live_seconds": LIVE_SECONDS,
+                "auth_max_fails": AUTH_MAX_FAILS,
+                "auth_block_seconds": AUTH_BLOCK_SECONDS,
             },
             "snmp": {
                 "enabled": bool(cfg["snmp"]["enabled"]),
@@ -2533,6 +2587,12 @@ def api_settings():
     if "live_seconds" in dash_in:
         cfg["dashboard"]["live_seconds"] = _as_int(
             dash_in.get("live_seconds", LIVE_SECONDS), LIVE_SECONDS, 2)
+    if "auth_max_fails" in dash_in:
+        cfg["dashboard"]["auth_max_fails"] = _as_int(
+            dash_in.get("auth_max_fails", AUTH_MAX_FAILS), AUTH_MAX_FAILS, 3)
+    if "auth_block_seconds" in dash_in:
+        cfg["dashboard"]["auth_block_seconds"] = _as_int(
+            dash_in.get("auth_block_seconds", AUTH_BLOCK_SECONDS), AUTH_BLOCK_SECONDS, 30)
     password = str(dash_in.get("password") or "")
     if password:
         cfg["dashboard"]["password"] = password
@@ -2915,6 +2975,12 @@ def api_db_status():
                                  "backup": dbcfg.get("backup") or {}}})
 
 
+@app.route("/api/db/health")
+def api_db_health():
+    """تقرير صحة قاعدة البيانات: زمن الاستجابة، التجمع، النسخ والتوصيات."""
+    return jsonify({"ok": True, "health": DBM.health_report(), "version": VERSION})
+
+
 @app.route("/api/db/backups")
 def api_db_backups():
     return jsonify({"ok": True, "dir": DBM.backup_dir,
@@ -2961,6 +3027,8 @@ def api_db_settings():
                           else bool(wdv))
     if "watchdog_seconds" in pg_in:
         pg["watchdog_seconds"] = _as_int(pg_in.get("watchdog_seconds"), 15, 5)
+    if "pool_size" in pg_in:
+        pg["pool_size"] = _as_int(pg_in.get("pool_size"), 8, 1)
     dbc["postgres"] = pg
     bk = dbc.get("backup") or {}
     bk_in = data.get("backup") or {}
@@ -3292,6 +3360,12 @@ h2 .muted{font-weight:400}
 .msg{font-size:12.5px;border-radius:10px;padding:9px 12px;border:1px solid var(--line);background:rgba(22,35,51,.8)}
 .msg.ok{color:#a7e9b6;border-color:rgba(63,185,80,.3);background:rgba(16,52,29,.55)}
 .msg.bad,.msg.err{color:#ffb4ae;border-color:rgba(248,81,73,.3);background:rgba(58,22,20,.55)}
+.health-report{white-space:pre-wrap;word-break:break-word;font:12.5px/1.9 "Segoe UI",Tahoma,sans-serif;
+  margin:10px 0 0;padding:12px 14px;border-radius:10px;border:1px solid var(--line);
+  background:rgba(22,35,51,.8);color:var(--tx);max-height:340px;overflow:auto;direction:rtl}
+.health-report.good{border-color:rgba(63,185,80,.35)}
+.health-report.warning{border-color:rgba(210,153,34,.4)}
+.health-report.critical{border-color:rgba(248,81,73,.4)}
 .scan-head{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .scan-progress{height:8px;border-radius:6px;background:rgba(22,35,51,.9);overflow:hidden;border:1px solid var(--line)}
 .scan-progress i{display:block;height:100%;background:var(--grad);width:0;transition:width .25s}
@@ -3647,9 +3721,11 @@ h2 .muted{font-weight:400}
       <button type="button" class="btn ghost mini" id="db-refresh">↻ تحديث</button>
       <button type="button" class="btn mini" id="db-backup-now">＋ نسخة الآن</button>
       <button type="button" class="btn ghost mini" id="db-wd-check">🔁 فحص/إصلاح الآن</button>
+      <button type="button" class="btn ghost mini" id="db-health-btn">📋 تقرير الصحة</button>
     </div>
     <div class="cards" id="db-status-cards"></div>
     <div class="msg" id="db-msg" hidden></div>
+    <pre id="db-health-box" class="health-report" hidden></pre>
     <div class="viewhead" style="margin-top:12px">
       <h3 style="margin:0">الإعدادات</h3>
       <span class="hint" id="db-dir-hint"></span>
@@ -3680,6 +3756,7 @@ h2 .muted{font-weight:400}
       <label style="flex:1">مجلد البيانات<input id="db-data-dir" maxlength="200" placeholder="اختياري — يُكتشف تلقائياً"></label>
       <label><input type="checkbox" id="db-watchdog"> مراقبة تلقائية</label>
       <label>الفحص (ث)<input id="db-wd-sec" type="number" min="5" max="600"></label>
+      <label>الاتصالات المجمّعة<input id="db-pool-size" type="number" min="1" max="64" title="تقليل عدد عمليات PostgreSQL الخلفية يخفف أخطاء الذاكرة المشتركة"></label>
       <span class="hint" id="db-wd-hint"></span>
     </div>
     <div class="viewhead" style="margin-top:12px">
@@ -3909,6 +3986,8 @@ h2 .muted{font-weight:400}
       <div class="grid2">
         <label>كلمة مرور جديدة (فارغة = بدون تغيير)<input id="s-dash-pass" type="password" autocomplete="new-password" placeholder="اتركها فارغة للإبقاء"></label>
         <label>منفذ اللوحة (يتطلب إعادة تشغيل)<input id="s-dash-port" type="number" min="1" max="65535"></label>
+        <label>محاولات الدخول قبل الحظر<input id="s-auth-fails" type="number" min="3" max="20" title="بعد تكرار المحاولات الفاشلة من نفس العنوان يُحظر مؤقتاً"></label>
+        <label>مدة الحظر (ثانية)<input id="s-auth-block" type="number" min="30" max="86400"></label>
       </div>
       <label class="checks" style="color:var(--mut);font-size:12.5px">
         <input type="checkbox" id="s-dash-clear"> إزالة كلمة المرور الحالية (غير مستحسن)
@@ -4555,7 +4634,9 @@ function renderDb(){
     ["الحجم", fmtBytes(st.size_bytes), "neutral"],
     ["الأحداث", t.events || 0, "neutral"],
     ["القياسات", t.samples || 0, "neutral"],
-    ["النسخ", st.backup_count || 0, "ok"]
+    ["النسخ", st.backup_count || 0, "ok"],
+    ...(st.driver === "postgres" ? [["التجمع",
+      (((st.pool || {}).idle) || 0) + "/" + (((st.pool || {}).max) || 8), "neutral"]] : [])
   ];
   $("db-status-cards").replaceChildren(...stats.map(([k, v, c]) => {
     const el = mk("div", "card " + c);
@@ -4582,6 +4663,7 @@ function renderDb(){
   $("db-data-dir").value = pgc.data_dir || "";
   $("db-watchdog").checked = pgc.watchdog !== false;
   $("db-wd-sec").value = pgc.watchdog_seconds || 15;
+  $("db-pool-size").value = pgc.pool_size || 8;
   const wd = st.watchdog || {};
   $("db-wd-hint").textContent = !wd.enabled ? "المراقبة متوقفة"
     : ("آخر فحص: " + (wd.last || "—") +
@@ -4637,6 +4719,43 @@ async function dbWatchdogCheck(){
     }, 5000);
   } catch(e){ msg("db-msg", e.message, "err"); }
 }
+async function dbHealth(){
+  const box = $("db-health-box");
+  box.hidden = false;
+  box.className = "health-report";
+  box.textContent = "جارٍ إعداد تقرير الصحة…";
+  try {
+    const r = await fetch("/api/db/health", {cache:"no-store"}).then(r => r.json());
+    const h = r.health || {}, p = h.pool || {}, w = h.watchdog || {}, b = h.backups || {};
+    const rows = [
+      "🩺 تقرير صحة قاعدة البيانات — " + new Date().toLocaleString("ar-SY"),
+      "• الحالة: " + (h.state === "good" ? "ممتازة" : h.state === "warning" ? "تحتاج انتباهاً" : "حرجة"),
+      "• المحرك: " + (h.driver === "postgres" ? "PostgreSQL" : "SQLite"),
+      "• الاتصال: " + (h.connected ? "متصل" : ("غير متصل — " + (h.error || ""))),
+      "• زمن الاستجابة: " + (h.latency_ms == null ? "—" : h.latency_ms + " مللي ثانية"),
+      "• الإصدار: " + (h.version || "—"),
+      "• الحجم: " + fmtBytes(h.size_bytes || 0),
+      "• الأحداث / القياسات: " + ((h.tables||{}).events||0) + " / " + ((h.tables||{}).samples||0),
+      "• التجمع: خامل " + (p.idle||0) + " من " + (p.max||0) +
+        " · أُنشئ " + (p.created||0) + " · أُعيد استخدام " + (p.reused||0) +
+        " · إعادة محاولة " + (p.retries||0),
+      "• المراقبة: " + (w.enabled ? "مفعّلة · إعادة تشغيل: " + (w.restarts||0) : "متوقفة"),
+      "• النسخ: " + (b.enabled ? ((b.count||0) + " نسخة · أحدثها قبل " +
+        (b.age_hours == null ? "—" : b.age_hours + " ساعة")) : "متوقف")
+    ];
+    if (h.postgres && h.postgres.max_connections)
+      rows.push("• PostgreSQL: max_connections=" + h.postgres.max_connections +
+        " · shared_buffers=" + (h.postgres.shared_buffers || "—"));
+    const recs = h.recommendations || [];
+    rows.push("", recs.length ? "التوصيات:" : "التوصيات: لا توجد ملاحظات — كل شيء يعمل بشكل طبيعي.");
+    for (const x of recs) rows.push("  - " + x);
+    box.className = "health-report " + (h.state || "");
+    box.textContent = rows.join(String.fromCharCode(10));
+  } catch(e){
+    box.className = "health-report critical";
+    box.textContent = "تعذر إعداد التقرير: " + e.message;
+  }
+}
 async function dbSave(){
   const driver = $("db-driver").value;
   const body = {driver:driver, backup:{
@@ -4656,7 +4775,8 @@ async function dbSave(){
       bin_dir:$("db-bin").value || "",
       data_dir:$("db-data-dir").value || "",
       watchdog:$("db-watchdog").checked,
-      watchdog_seconds:Number($("db-wd-sec").value) || 15
+      watchdog_seconds:Number($("db-wd-sec").value) || 15,
+      pool_size:Number($("db-pool-size").value) || 8
     };
     if ($("db-password").value) body.postgres.password = $("db-password").value;
   }
@@ -4739,6 +4859,8 @@ async function openSettings(){
     $("s-dash-pass").value = "";
     $("s-dash-pass").placeholder = dd.has_password ? "•••••• (محفوظة — اتركها فارغة للإبقاء)" : "بدون كلمة مرور";
     $("s-dash-port").value = dd.port ?? 8080;
+    $("s-auth-fails").value = dd.auth_max_fails ?? 6;
+    $("s-auth-block").value = dd.auth_block_seconds ?? 300;
     $("s-dash-clear").checked = false;
 
     const sn = j.snmp || {};
@@ -4823,6 +4945,8 @@ async function saveSettings(ev){
     dashboard: {
       password: $("s-dash-pass").value,
       port: Number($("s-dash-port").value) || 8080,
+      auth_max_fails: Number($("s-auth-fails").value) || 6,
+      auth_block_seconds: Number($("s-auth-block").value) || 300,
       live_seconds: Number($("s-live").value) || 5,
       clear_password: $("s-dash-clear").checked
     },
@@ -5664,6 +5788,7 @@ $("ev-refresh").addEventListener("click", loadHistory);
 $("db-refresh").addEventListener("click", loadDb);
 $("db-backup-now").addEventListener("click", dbBackupNow);
 $("db-wd-check").addEventListener("click", dbWatchdogCheck);
+$("db-health-btn").addEventListener("click", dbHealth);
 $("db-save").addEventListener("click", dbSave);
 $("db-migrate").addEventListener("click", dbMigrate);
 $("db-driver").addEventListener("change", () => {
@@ -6745,6 +6870,8 @@ def render_config(cfg):
         f"  port: {d['port']}",
         f"  password: {_yaml_str(d['password'])}   # فارغة = بدون كلمة مرور",
         f"  live_seconds: {d['live_seconds']}      # تحديث الصفحة كل كم ثانية",
+        f"  auth_max_fails: {d['auth_max_fails']}   # محاولات دخول فاشلة قبل الحظر المؤقت",
+        f"  auth_block_seconds: {d['auth_block_seconds']}   # مدة الحظر بالثواني",
         "",
         f"heartbeat_hour: {hb}      # ساعة التقرير اليومي (0-23)، null لإلغائه",
         "",
@@ -6782,6 +6909,7 @@ def render_config(cfg):
         f"    watchdog: {str(pg['watchdog']).lower()}   # إعادة تشغيل PostgreSQL تلقائياً عند التوقف",
         f"    watchdog_seconds: {pg['watchdog_seconds']}   # فترة الفحص (5-600 ثانية)",
         f"    data_dir: {_yaml_str(pg['data_dir'])}   # مجلد بيانات PG (اختياري — يُكتشف تلقائياً)",
+        f"    pool_size: {pg['pool_size']}   # عدد الاتصالات المُعاد استخدامها (1-64)",
         "  backup:",
         f"    enabled: {str(bk['enabled']).lower()}",
         f"    dir: {_yaml_str(bk['dir'])}   # نسبي لمجلد نبض أو مسار مطلق",
@@ -7097,6 +7225,41 @@ def db_watchdog_loop():
 
 
 # ---------------------------------------------------------------- التشغيل
+def cmd_db_health():
+    """تقرير صحة قاعدة البيانات من سطر الأوامر: python nabd.py --db-health"""
+    h = DBM.health_report()
+    state = {"good": "ممتازة", "warning": "تحتاج انتباهاً",
+             "critical": "حرجة"}.get(h["state"], h["state"])
+    pool = h["pool"] or {}
+    wd = h["watchdog"] or {}
+    bk = h["backups"] or {}
+    print("🩺 تقرير صحة قاعدة بيانات نبض")
+    print("  الحالة: " + state)
+    print("  المحرك: " + ("PostgreSQL" if h["driver"] == "postgres" else "SQLite"))
+    print("  الاتصال: " + ("متصل" if h["connected"] else "غير متصل — " + h["error"]))
+    print("  زمن الاستجابة: " + ("—" if h["latency_ms"] is None
+                                  else str(h["latency_ms"]) + " مللي ثانية"))
+    print("  الإصدار: " + (h["version"] or "—"))
+    print("  المسار: " + (h["path"] or "—"))
+    print("  الحجم: " + str(h["size_bytes"]) + " بايت")
+    print("  التجمع: خامل " + str(pool.get("idle", 0)) + " / " + str(pool.get("max", 0)) +
+          " · أُنشئ " + str(pool.get("created", 0)) +
+          " · أُعيد استخدام " + str(pool.get("reused", 0)))
+    print("  المراقبة: " + ("مفعّلة · إعادة تشغيل " + str(wd.get("restarts", 0))
+                            if wd.get("enabled") else "متوقفة"))
+    print("  النسخ: " + str(bk.get("count", 0)) + " · أحدثها قبل " +
+          ("—" if bk.get("age_hours") is None else str(bk["age_hours"]) + " ساعة"))
+    if h["postgres"]:
+        print("  PostgreSQL: " + ", ".join(f"{k}={v}" for k, v in h["postgres"].items()))
+    if h["recommendations"]:
+        print("  التوصيات:")
+        for r in h["recommendations"]:
+            print("   • " + r)
+    else:
+        print("  التوصيات: لا توجد ملاحظات — كل شيء يعمل بشكل طبيعي.")
+    return 0 if h["ok"] else 1
+
+
 def main():
     if "--setup" in sys.argv:
         return cmd_setup()
@@ -7106,6 +7269,8 @@ def main():
         return cmd_test()
     if "--check" in sys.argv:
         return cmd_check()
+    if "--db-health" in sys.argv:
+        return cmd_db_health()
     if "--discover" in sys.argv:
         return cmd_discover()
     if "--scan" in sys.argv:

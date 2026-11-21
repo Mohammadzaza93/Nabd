@@ -31,6 +31,12 @@ if not st["connected"] and st["driver"] == "postgres":
     st = db.status()
 print("driver:", st["driver"], "connected:", st["connected"], st["version"])
 assert st["connected"], st.get("error")
+assert "pool" in st and "idle" in st["pool"], st.get("pool")
+
+h = db.health_report()
+print("health:", h["state"], h["latency_ms"], "ms", len(h["recommendations"]), "tips")
+assert h["connected"] and isinstance(h["recommendations"], list)
+assert h["pool"]["max"] >= 1
 
 now = time.time()
 name = "TEST-DB-%d" % int(now)

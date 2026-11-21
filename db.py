@@ -137,6 +137,13 @@ class Database:
         self._wd_last_at = 0.0
         self.on_event = None
 
+        # تجمع اتصالات صغير: يقلّل إنشاء backends في PostgreSQL ويخفّف
+        # أخطاء حجز الذاكرة المشتركة على Windows عند كثرة الاستعلامات.
+        self.pool_size = _to_int(pg.get("pool_size"), 8, 1)
+        self._pool = []
+        self._pool_lock = threading.Lock()
+        self.pool_stats = {"created": 0, "reused": 0, "closed": 0, "retries": 0}
+
     # ------------------------------------------------------------- الاتصال
     def _connect(self):
         if self.driver == "sqlite":
@@ -145,11 +152,87 @@ class Database:
             return c
         if psycopg is None:
             raise RuntimeError("psycopg غير مثبّت — ثبّت: pip install 'psycopg[binary]'")
+        if self._pool:
+            with self._pool_lock:
+                if self._pool:
+                    self.pool_stats["reused"] += 1
+                    return self._pool.pop()
         p = self.pg
         kw = dict(host=p["host"], port=p["port"], dbname=p["dbname"],
                   user=p["user"], password=p["password"],
                   sslmode=p["sslmode"], autocommit=True, connect_timeout=5)
-        return psycopg.connect(**kw)
+        c = psycopg.connect(**kw)
+        self.pool_stats["created"] += 1
+        return c
+
+    def _release(self, c):
+        if c is None:
+            return
+        if self.driver == "postgres":
+            keep = False
+            try:
+                keep = not getattr(c, "closed", 1)
+            except Exception:
+                keep = False
+            if keep:
+                with self._pool_lock:
+                    if len(self._pool) < self.pool_size:
+                        self._pool.append(c)
+                        return
+            try:
+                c.close()
+            except Exception:
+                pass
+            self.pool_stats["closed"] += 1
+            return
+        c.close()
+
+    def _discard(self, c):
+        try:
+            if c is not None:
+                c.close()
+        except Exception:
+            pass
+        if self.driver == "postgres":
+            self.pool_stats["closed"] += 1
+
+    def _run(self, fn):
+        """ينفّذ عملية على اتصال من التجمع، مع إعادة محاولة واحدة عند فشل PostgreSQL."""
+        attempts = 2 if self.driver == "postgres" else 1
+        for attempt in range(attempts):
+            c = None
+            try:
+                c = self._connect()
+                return fn(c)
+            except Exception:
+                self._discard(c)   # لا نُعيد اتصالاً فاسداً إلى التجمع
+                c = None
+                if attempt + 1 >= attempts:
+                    raise
+                self.pool_stats["retries"] += 1
+            finally:
+                if c is not None:
+                    self._release(c)
+        return None
+
+    def set_pool_size(self, n):
+        """ضبط حجم التجمع أثناء التشغيل مع إغلاق الاتصالات الزائدة."""
+        self.pool_size = _to_int(n, self.pool_size, 1)
+        with self._pool_lock:
+            extra = self._pool[self.pool_size:]
+            self._pool = self._pool[:self.pool_size]
+        for c in extra:
+            try:
+                c.close()
+            except Exception:
+                pass
+        self.pool_stats["closed"] += len(extra)
+
+    def pool_status(self):
+        with self._pool_lock:
+            idle = len(self._pool)
+        return {"driver": self.driver, "idle": idle, "max": self.pool_size,
+                **dict(self.pool_stats)}
 
     def _translate(self, sql, args):
         """يُرجع (SQL, args) بالصيغة المناسبة للمحرك الحالي."""
@@ -186,16 +269,16 @@ class Database:
         sql, args = self._translate(sql, args)
         if not sql:
             return []
-        c = self._connect()
-        try:
+
+        def _do(c):
             cur = c.execute(sql, args)
             if cur.description is None:  # CREATE / INSERT / UPDATE / DELETE
                 if self.driver == "sqlite":
                     c.commit()
                 return []
             return [tuple(r) for r in cur.fetchall()]
-        finally:
-            c.close()
+
+        return self._run(_do)
 
     def executemany(self, sql, rows):
         rows = [tuple(r) for r in (rows or [])]
@@ -204,15 +287,15 @@ class Database:
         sql, _ = self._translate(sql, ())
         if not sql:
             return 0
-        c = self._connect()
-        try:
+
+        def _do(c):
             with c.cursor() as cur:
                 cur.executemany(sql, rows)
             if self.driver == "sqlite":
                 c.commit()
             return len(rows)
-        finally:
-            c.close()
+
+        return self._run(_do)
 
     # ------------------------------------------------------------- المخطط
     def init_schema(self):
@@ -440,7 +523,67 @@ class Database:
         out["backup_count"] = len(self.list_backups())
         out["backup_settings"] = dict(self.backup_cfg)
         out["watchdog"] = self.watchdog_status()
+        out["pool"] = self.pool_status()
         return out
+
+    def health_report(self):
+        """تقرير صحة شامل يستخدمه كل من التقرير في اللوحة وسطر الأوامر."""
+        st = self.status()
+        rec = []
+        t0 = time.time()
+        try:
+            self.query("SELECT 1")
+            latency = round((time.time() - t0) * 1000, 1)
+        except Exception as e:
+            latency = None
+            rec.append("تعذّل الوصول إلى قاعدة البيانات: " + str(e)[:160])
+
+        pg_info = {}
+        if st["connected"] and self.driver == "postgres":
+            for key in ("max_connections", "shared_buffers"):
+                try:
+                    pg_info[key] = str(self.query("SHOW " + key)[0][0])
+                except Exception:
+                    pass
+
+        bks = self.list_backups()
+        latest = bks[0]["ts"] if bks else 0
+        age_h = round((time.time() - latest) / 3600, 1) if latest else None
+        interval = _to_int(self.backup_cfg.get("interval_hours"), 6, 1)
+        binfo = {"enabled": bool(self.backup_cfg.get("enabled")), "count": len(bks),
+                 "latest": latest, "age_hours": age_h, "interval_hours": interval,
+                 "dir": self.backup_dir}
+        if not binfo["enabled"]:
+            rec.append("النسخ الاحتياطي التلقائي متوقف — فعّله من واجهة قاعدة البيانات.")
+        elif not bks:
+            rec.append("لا توجد نسخة احتياطية بعد — أنشئ نسخة الآن.")
+        elif age_h is not None and age_h > max(interval * 2, 12):
+            rec.append(f"أحدث نسخة احتياطية عمرها {age_h} ساعة — أنشئ نسخة الآن.")
+
+        if self.driver == "postgres":
+            if not st["connected"]:
+                rec.insert(0, "PostgreSQL غير متصل — استخدم زر «فحص/إصلاح الآن».")
+            else:
+                mc = _to_int(pg_info.get("max_connections"), 0, 0)
+                if mc and mc > 100:
+                    rec.append(f"max_connections={mc} مرتفع على Windows — "
+                               "يُنصح بخفضه إلى 50 لتقليل أخطاء الذاكرة المشتركة.")
+                pool = st.get("pool") or {}
+                if _to_int(pool.get("retries"), 0, 0) > 5:
+                    rec.append("لوحظت إعادة محاولة اتصالات متعددة — راقب سجل PostgreSQL.")
+                wd = st.get("watchdog") or {}
+                if not wd.get("enabled"):
+                    rec.append("المراقبة التلقائية متوقفة — فعّلها لإعادة تشغيل PostgreSQL عند التوقف.")
+
+        critical = not st["connected"]
+        state = "critical" if critical else ("warning" if rec else "good")
+        return {"ok": st["connected"], "state": state, "checked_at": time.time(),
+                "driver": self.driver, "connected": st["connected"],
+                "latency_ms": latency, "version": st.get("version", ""),
+                "size_bytes": st.get("size_bytes", 0), "path": st.get("path", ""),
+                "tables": st.get("tables", {}), "error": st.get("error", ""),
+                "pool": st.get("pool", {}), "watchdog": st.get("watchdog", {}),
+                "backups": binfo, "postgres": pg_info, "recommendations": rec}
 
     # ------------------------------------------------------------- النسخ الاحتياطي
     def _gzip_file(self, src, dst):
