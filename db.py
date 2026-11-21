@@ -22,6 +22,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import threading
 import time
 from datetime import datetime
 
@@ -32,6 +33,13 @@ except ImportError:  # يُترك الاستيراد هنا حتى يعمل وض
 
 IS_WIN = os.name == "nt"
 STAMP_RE = re.compile(r"nabd-(\d{8})-(\d{6})-([a-z]+)\.(db|sql)\.gz$")
+
+
+def _to_int(value, default, minimum=0):
+    try:
+        return max(minimum, int(value))
+    except (TypeError, ValueError):
+        return default
 
 TABLE_COLUMNS = {
     "events": ["ts", "name", "ip", "etype"],
@@ -104,6 +112,31 @@ class Database:
         }
         self._last_backup = 0.0
 
+        # مراقب PostgreSQL: يعيد تشغيل الخادم تلقائياً إذا توقف أثناء العمل
+        wd = pg.get("watchdog")
+        if isinstance(wd, dict):
+            wd_enabled = bool(wd.get("enabled", True))
+            wd_interval = wd.get("interval_seconds")
+            wd_data = wd.get("data_dir")
+            wd_log = wd.get("log_file")
+        else:
+            wd_enabled = wd is None or bool(wd)
+            wd_interval, wd_data, wd_log = None, None, None
+        self.watchdog = {
+            "enabled": wd_enabled,
+            "interval": _to_int(wd_interval or pg.get("watchdog_seconds"), 15, 5),
+            "data_dir": str(wd_data or pg.get("data_dir") or
+                            os.environ.get("NABD_PG_DATA") or ""),
+            "log_file": str(wd_log or pg.get("log_file") or ""),
+        }
+        self._wd_lock = threading.Lock()
+        self._wd_next = 0.0
+        self._wd_fails = 0
+        self._wd_restarts = 0
+        self._wd_last = ""
+        self._wd_last_at = 0.0
+        self.on_event = None
+
     # ------------------------------------------------------------- الاتصال
     def _connect(self):
         if self.driver == "sqlite":
@@ -113,10 +146,10 @@ class Database:
         if psycopg is None:
             raise RuntimeError("psycopg غير مثبّت — ثبّت: pip install 'psycopg[binary]'")
         p = self.pg
-        return psycopg.connect(host=p["host"], port=p["port"], dbname=p["dbname"],
-                               user=p["user"], password=p["password"],
-                               sslmode=p["sslmode"], autocommit=True,
-                               connect_timeout=5)
+        kw = dict(host=p["host"], port=p["port"], dbname=p["dbname"],
+                  user=p["user"], password=p["password"],
+                  sslmode=p["sslmode"], autocommit=True, connect_timeout=5)
+        return psycopg.connect(**kw)
 
     def _translate(self, sql, args):
         """يُرجع (SQL, args) بالصيغة المناسبة للمحرك الحالي."""
@@ -227,6 +260,159 @@ class Database:
         for sql in stmts:
             self.query(sql)
 
+    # ------------------------------------------------------------- مراقب PostgreSQL
+    def _notify(self, text):
+        cb = getattr(self, "on_event", None)
+        if callable(cb):
+            try:
+                cb(text)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _no_window():
+        flag = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        return {"creationflags": flag} if IS_WIN and flag else {}
+
+    def _backoff(self):
+        """فترة انتظار متصاعدة حتى لا نُغرق الخادم بمحاولات إعادة تشغيل."""
+        return min(300, self.watchdog["interval"] * (2 ** min(self._wd_fails, 5)))
+
+    def _pg_ping(self, timeout=2):
+        if psycopg is None:
+            return False
+        try:
+            p = self.pg
+            c = psycopg.connect(host=p["host"], port=p["port"], dbname=p["dbname"],
+                                user=p["user"], password=p["password"],
+                                sslmode=p["sslmode"], autocommit=True,
+                                connect_timeout=timeout)
+            try:
+                c.execute("SELECT 1")
+            finally:
+                c.close()
+            return True
+        except Exception:
+            return False
+
+    def _pg_ctl_paths(self):
+        """يُرجع (pg_ctl, مجلد البيانات, ملف السجل) أو None عند تعذّر الكشف."""
+        bindir = self.pg.get("bin_dir") or ""
+        ctl = ""
+        if bindir:
+            cand = os.path.join(bindir, "pg_ctl.exe" if IS_WIN else "pg_ctl")
+            if os.path.isfile(cand):
+                ctl = cand
+        if not ctl:
+            ctl = _pg_bin("pg_ctl")
+        if not ctl:
+            return None
+
+        candidates = []
+        if self.watchdog["data_dir"]:
+            candidates.append(self.watchdog["data_dir"])
+        if bindir:
+            candidates += [
+                os.path.join(os.path.dirname(os.path.dirname(bindir)), "data"),
+                os.path.join(os.path.dirname(bindir), "data"),
+            ]
+        candidates.append(os.path.join(os.path.expanduser("~"), "AppData",
+                                       "Local", "nabd-pg", "data"))
+        if IS_WIN:
+            candidates += glob.glob("C:/Program Files/PostgreSQL/*/data")
+        else:
+            candidates += glob.glob("/var/lib/postgresql/*/main")
+            candidates += glob.glob("/usr/local/pgsql/data")
+        data = ""
+        for cand in candidates:
+            if cand and os.path.isfile(os.path.join(cand, "PG_VERSION")):
+                data = cand
+                break
+        if not data:
+            return None
+        log = self.watchdog["log_file"] or os.path.join(os.path.dirname(data), "pg.log")
+        return ctl, data, log
+
+    def ensure_postgres(self, force=False):
+        """يفحص PostgreSQL ويعيد تشغيله عند التوقف. آمن مع SQLite/CI."""
+        if self.driver != "postgres" or not self.watchdog["enabled"] or psycopg is None:
+            return False
+        with self._wd_lock:
+            now = time.time()
+            if not force and now < self._wd_next:
+                return False
+            if self._pg_ping():
+                self._wd_fails = 0
+                self._wd_last = "متصل"
+                self._wd_last_at = now
+                return True
+
+            paths = self._pg_ctl_paths()
+            if not paths:
+                self._wd_fails += 1
+                self._wd_next = now + self._backoff()
+                self._wd_last = "تعذّر العثور على pg_ctl أو مجلد بيانات PostgreSQL"
+                self._wd_last_at = now
+                self._notify("⚠ مراقب قاعدة البيانات: " + self._wd_last)
+                return False
+            ctl, data, log = paths
+            p = self.pg
+            opts = '-p %d -h "%s"' % (p["port"], p["host"])
+            running = False
+            try:
+                st = subprocess.run([ctl, "status", "-D", data], capture_output=True,
+                                    text=True, timeout=10, **self._no_window())
+                running = st.returncode == 0
+            except Exception:
+                running = False
+            if running:
+                cmd = [ctl, "restart", "-m", "fast", "-D", data, "-o", opts,
+                       "-l", log, "-w"]
+            else:
+                cmd = [ctl, "start", "-D", data, "-o", opts, "-l", log, "-w"]
+            proc_ok = False
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=35,
+                                   **self._no_window())
+                proc_ok = r.returncode == 0
+                lines = [x for x in ((r.stderr or "") + "\n" + (r.stdout or "")).splitlines()
+                         if x.strip()]
+                detail = lines[-1].strip()[:200] if lines else "لا تفاصيل"
+            except Exception as e:
+                detail = str(e)[:200]
+            # pg_ctl -w يضمن الجاهزية عند نجاحه؛ ننتظر أيضاً تأكيد الاتصال
+            ping_ok = False
+            for _ in range(30):
+                if self._pg_ping():
+                    ping_ok = True
+                    break
+                time.sleep(1)
+            ok = proc_ok or ping_ok
+            now = time.time()
+            if ok:
+                self._wd_fails = 0
+                self._wd_next = now + self.watchdog["interval"]
+                self._wd_restarts += 1
+                self._wd_last = "أُعيد تشغيل PostgreSQL تلقائياً"
+                self._wd_last_at = now
+                self._notify("🔄 " + self._wd_last + " — " + detail)
+            else:
+                self._wd_fails += 1
+                self._wd_next = now + self._backoff()
+                self._wd_last = "فشل إعادة تشغيل PostgreSQL: " + detail
+                self._wd_last_at = now
+                self._notify("⚠ مراقب قاعدة البيانات: " + self._wd_last)
+            return ok
+
+    def watchdog_status(self):
+        return {
+            "enabled": self.driver == "postgres" and self.watchdog["enabled"],
+            "interval": self.watchdog["interval"],
+            "restarts": self._wd_restarts,
+            "last": self._wd_last,
+            "at": self._wd_last_at,
+        }
+
     # ------------------------------------------------------------- الحالة
     def status(self):
         out = {"driver": self.driver, "connected": False, "version": "",
@@ -238,6 +424,8 @@ class Database:
                                      if os.path.exists(self.sqlite_path) else 0)
                 out["path"] = self.sqlite_path
             else:
+                if not self._pg_ping(2):
+                    raise RuntimeError("connection timeout expired")
                 out["version"] = str(self.query("SELECT version()")[0][0]).split(",")[0]
                 out["size_bytes"] = int(self.query(
                     "SELECT pg_database_size(current_database())")[0][0] or 0)
@@ -251,6 +439,7 @@ class Database:
         out["backup_dir"] = self.backup_dir
         out["backup_count"] = len(self.list_backups())
         out["backup_settings"] = dict(self.backup_cfg)
+        out["watchdog"] = self.watchdog_status()
         return out
 
     # ------------------------------------------------------------- النسخ الاحتياطي

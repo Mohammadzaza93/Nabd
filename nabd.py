@@ -303,6 +303,12 @@ def _normalize_config(cfg):
     pg["password"] = str(pg.get("password") or "")
     pg["sslmode"] = str(pg.get("sslmode") or "disable")
     pg["bin_dir"] = str(pg.get("bin_dir") or "")
+    wd = pg.get("watchdog")
+    pg["watchdog"] = (bool(wd.get("enabled", True)) if isinstance(wd, dict)
+                      else (wd is None or bool(wd)))
+    pg["watchdog_seconds"] = _as_int(pg.get("watchdog_seconds", 15), 15, 5)
+    pg["data_dir"] = str(pg.get("data_dir") or "")
+    pg["log_file"] = str(pg.get("log_file") or "")
     bk = dbc.get("backup") or {}
     dbc["backup"] = bk
     bk["enabled"] = bool(bk.get("enabled", True))
@@ -328,6 +334,12 @@ def apply_runtime_config(cfg):
     DBM.backup_dir = (_bdir if os.path.isabs(_bdir)
                       else os.path.join(BASE, _bdir))
     DBM.backup_cfg["dir"] = _bdir
+    pg = cfg["database"].get("postgres") or {}
+    DBM.watchdog["enabled"] = bool(pg.get("watchdog", True))
+    DBM.watchdog["interval"] = _as_int(pg.get("watchdog_seconds", 15), 15, 5)
+    DBM.watchdog["data_dir"] = str(pg.get("data_dir") or
+                                   os.environ.get("NABD_PG_DATA") or "")
+    DBM.watchdog["log_file"] = str(pg.get("log_file") or "")
     tg = cfg["telegram"]
     TOKEN = os.environ.get("NABD_TELEGRAM_TOKEN", "").strip() or str(tg.get("token") or "").strip()
     CHATS = list(tg.get("chat_ids") or [])
@@ -2937,11 +2949,18 @@ def api_db_settings():
         dbc["driver"] = str(data.get("driver") or "sqlite")
     pg = dbc.get("postgres") or {}
     pg_in = data.get("postgres") or {}
-    for k in ("host", "dbname", "user", "password", "sslmode", "bin_dir"):
+    for k in ("host", "dbname", "user", "password", "sslmode", "bin_dir",
+              "data_dir", "log_file"):
         if k in pg_in:
             pg[k] = str(pg_in.get(k) or "")
     if "port" in pg_in:
         pg["port"] = _as_int(pg_in.get("port"), 5432, 1)
+    if "watchdog" in pg_in:
+        wdv = pg_in.get("watchdog")
+        pg["watchdog"] = (bool(wdv.get("enabled", True)) if isinstance(wdv, dict)
+                          else bool(wdv))
+    if "watchdog_seconds" in pg_in:
+        pg["watchdog_seconds"] = _as_int(pg_in.get("watchdog_seconds"), 15, 5)
     dbc["postgres"] = pg
     bk = dbc.get("backup") or {}
     bk_in = data.get("backup") or {}
@@ -2962,6 +2981,30 @@ def api_db_settings():
     new_driver = str(_normalize_config(cfg)["database"]["driver"])
     return jsonify({"ok": True, "restart_required": new_driver != old_driver,
                     "db": DBM.status()})
+
+
+def _db_watchdog_async():
+    try:
+        DBM.ensure_postgres(force=True)
+    except Exception as e:
+        log(f"مراقب قاعدة البيانات: {e}")
+
+
+@app.route("/api/db/watchdog", methods=["POST"])
+def api_db_watchdog():
+    """فحص يدوي غير متزامن: يعيد تشغيل PostgreSQL إذا كان متوقفاً."""
+    guard = _write_guard()
+    if guard:
+        return guard
+    with CFG_LOCK:
+        driver = str((CFG.get("database") or {}).get("driver") or "sqlite")
+    if driver not in ("postgres", "postgresql", "pg"):
+        return jsonify({"ok": False, "error": "المراقبة متاحة مع PostgreSQL فقط"}), 400
+    if not DBM.watchdog["enabled"]:
+        return jsonify({"ok": False, "error": "المراقبة التلقائية متوقفة من الإعدادات"}), 400
+    threading.Thread(target=_db_watchdog_async, daemon=True,
+                     name="db-watchdog-manual").start()
+    return jsonify({"ok": True, "started": True, "status": DBM.watchdog_status()})
 
 
 @app.route("/api/db/migrate", methods=["POST"])
@@ -3603,6 +3646,7 @@ h2 .muted{font-weight:400}
       <span class="spacer"></span>
       <button type="button" class="btn ghost mini" id="db-refresh">↻ تحديث</button>
       <button type="button" class="btn mini" id="db-backup-now">＋ نسخة الآن</button>
+      <button type="button" class="btn ghost mini" id="db-wd-check">🔁 فحص/إصلاح الآن</button>
     </div>
     <div class="cards" id="db-status-cards"></div>
     <div class="msg" id="db-msg" hidden></div>
@@ -3633,6 +3677,10 @@ h2 .muted{font-weight:400}
       <label>المستخدم<input id="db-user" maxlength="64"></label>
       <label>كلمة المرور<input id="db-password" type="password" maxlength="128" autocomplete="new-password"></label>
       <label style="flex:1">مسار bin<input id="db-bin" maxlength="200" placeholder="C:/.../bin"></label>
+      <label style="flex:1">مجلد البيانات<input id="db-data-dir" maxlength="200" placeholder="اختياري — يُكتشف تلقائياً"></label>
+      <label><input type="checkbox" id="db-watchdog"> مراقبة تلقائية</label>
+      <label>الفحص (ث)<input id="db-wd-sec" type="number" min="5" max="600"></label>
+      <span class="hint" id="db-wd-hint"></span>
     </div>
     <div class="viewhead" style="margin-top:12px">
       <h3 style="margin:0">النسخ المتاحة</h3>
@@ -4531,6 +4579,13 @@ function renderDb(){
   $("db-name").value = pgc.dbname || "nabd";
   $("db-user").value = pgc.user || "nabd";
   $("db-bin").value = pgc.bin_dir || "";
+  $("db-data-dir").value = pgc.data_dir || "";
+  $("db-watchdog").checked = pgc.watchdog !== false;
+  $("db-wd-sec").value = pgc.watchdog_seconds || 15;
+  const wd = st.watchdog || {};
+  $("db-wd-hint").textContent = !wd.enabled ? "المراقبة متوقفة"
+    : ("آخر فحص: " + (wd.last || "—") +
+       (wd.restarts ? " · إعادة تشغيل: " + wd.restarts : ""));
   const frag = document.createDocumentFragment();
   for (const b of list){
     const tr = document.createElement("tr");
@@ -4563,6 +4618,25 @@ async function dbBackupNow(){
     state.db = null; loadDb();
   } catch(e){ msg("db-msg", e.message, "err"); }
 }
+async function dbWatchdogCheck(){
+  msg("db-msg", "جارٍ فحص PostgreSQL — ستظهر النتيجة تلقائياً.");
+  try {
+    const r = await postJSON("/api/db/watchdog", {});
+    if (!r.ok) throw new Error(r.error || "تعذر بدء الفحص");
+    let n = 0;
+    const timer = setInterval(async () => {
+      n++;
+      await loadDb();
+      const wd = (state.db && state.db.status.db && state.db.status.db.watchdog) || {};
+      const up = !!(state.db && state.db.status.db && state.db.status.db.connected);
+      if (n >= 16 || up){
+        clearInterval(timer);
+        msg("db-msg", wd.restarts ? "تمت إعادة تشغيل PostgreSQL تلقائياً."
+          : "PostgreSQL يعمل — لا حاجة للإصلاح.", "ok");
+      }
+    }, 5000);
+  } catch(e){ msg("db-msg", e.message, "err"); }
+}
 async function dbSave(){
   const driver = $("db-driver").value;
   const body = {driver:driver, backup:{
@@ -4579,7 +4653,10 @@ async function dbSave(){
       port:Number($("db-port").value) || 5432,
       dbname:$("db-name").value || "nabd",
       user:$("db-user").value || "nabd",
-      bin_dir:$("db-bin").value || ""
+      bin_dir:$("db-bin").value || "",
+      data_dir:$("db-data-dir").value || "",
+      watchdog:$("db-watchdog").checked,
+      watchdog_seconds:Number($("db-wd-sec").value) || 15
     };
     if ($("db-password").value) body.postgres.password = $("db-password").value;
   }
@@ -5586,6 +5663,7 @@ $("map-group").addEventListener("change", (e) => {
 $("ev-refresh").addEventListener("click", loadHistory);
 $("db-refresh").addEventListener("click", loadDb);
 $("db-backup-now").addEventListener("click", dbBackupNow);
+$("db-wd-check").addEventListener("click", dbWatchdogCheck);
 $("db-save").addEventListener("click", dbSave);
 $("db-migrate").addEventListener("click", dbMigrate);
 $("db-driver").addEventListener("change", () => {
@@ -6701,6 +6779,9 @@ def render_config(cfg):
         f"    password: {_yaml_str(pg['password'])}   # أو NABD_PG_PASSWORD",
         f"    sslmode: {_yaml_str(pg['sslmode'])}",
         f"    bin_dir: {_yaml_str(pg['bin_dir'])}   # مجلد pg_dump/psql (اختياري)",
+        f"    watchdog: {str(pg['watchdog']).lower()}   # إعادة تشغيل PostgreSQL تلقائياً عند التوقف",
+        f"    watchdog_seconds: {pg['watchdog_seconds']}   # فترة الفحص (5-600 ثانية)",
+        f"    data_dir: {_yaml_str(pg['data_dir'])}   # مجلد بيانات PG (اختياري — يُكتشف تلقائياً)",
         "  backup:",
         f"    enabled: {str(bk['enabled']).lower()}",
         f"    dir: {_yaml_str(bk['dir'])}   # نسبي لمجلد نبض أو مسار مطلق",
@@ -7002,6 +7083,19 @@ def cmd_check():
     print("إذا كانت أجهزة الشبكة لا تستجيب بينما الراوتر يعمل، تأكد أن نبض يعمل على جهاز داخل نفس الشبكة.")
 
 
+# ---------------------------------------------------------------- مراقب قاعدة البيانات
+def db_watchdog_loop():
+    """يفحص PostgreSQL دورياً ويعيد تشغيله إذا توقف أثناء عمل نبض."""
+    time.sleep(10)
+    while True:
+        try:
+            if DBM.watchdog["enabled"] and DBM.driver == "postgres":
+                DBM.ensure_postgres()
+        except Exception as e:
+            log(f"مراقب قاعدة البيانات: {e}")
+        time.sleep(max(5, DBM.watchdog["interval"]))
+
+
 # ---------------------------------------------------------------- التشغيل
 def main():
     if "--setup" in sys.argv:
@@ -7017,6 +7111,7 @@ def main():
     if "--scan" in sys.argv:
         return cmd_scan()
 
+    DBM.on_event = log
     init_db()
     DEVS.update(load_devices())
     if not DEVS:
@@ -7032,6 +7127,7 @@ def main():
     if not DASH_PW and DASH_HOST in ("0.0.0.0", "::"):
         log("تحذير: لوحة التحكم مفتوحة لكل من يصل للشبكة بدون كلمة مرور. عيّن dashboard.password.")
 
+    threading.Thread(target=db_watchdog_loop, daemon=True, name="db-watchdog").start()
     threading.Thread(target=tg_worker, daemon=True, name="telegram").start()
     threading.Thread(target=email_worker, daemon=True, name="email").start()
     threading.Thread(target=webhook_worker, daemon=True, name="webhook").start()
