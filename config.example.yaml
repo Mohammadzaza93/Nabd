@@ -19,7 +19,10 @@ notifications:
   daily_report: true
   port_down: true
   high_cpu: true
+  high_mem: true
+  high_rtt: true
   sfp_low: true
+  custom_sensor: true
 
 check_interval: 10     # فحص كل كم ثانية
 fail_threshold: 3      # عدد الفشل المتتالي قبل اعتبار الجهاز متوقفاً
@@ -46,6 +49,8 @@ snmp:
   poll_seconds: 60   # كل كم ثانية يُستعلم عن الأجهزة
   history_points: 120   # عدد نقاط رسم الحركة في الذاكرة
   cpu_warn: 85   # نسبة CPU التي تُطلق تنبيهاً
+  mem_warn: 85   # نسبة الذاكرة التي تُطلق تنبيهاً
+  rtt_warn: 200.0   # تأخير الاتصال (ms) الذي يُطلق تنبيهاً
   sfp_rx_min: -20.0   # حد إنذار ضعف استقبال SFP (dBm)
   alert_cooldown_minutes: 30   # منع تكرار نفس التنبيه
 

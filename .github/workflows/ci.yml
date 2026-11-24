@@ -30,3 +30,6 @@ jobs:
 
       - name: Database and backup test
         run: python tests/test_db.py
+
+      - name: Deeper monitoring test (thresholds and custom sensors)
+        run: python tests/test_monitor.py

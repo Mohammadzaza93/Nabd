@@ -20,7 +20,11 @@ with open(CFG_PATH, encoding="utf-8") as f:
     cfg = yaml.safe_load(f) or {}
 
 db = Database(ROOT, cfg.get("database") or {})
-db.init_schema()
+db.ensure_postgres()  # لا يفعل شيئاً في وضع SQLite/CI
+try:
+    db.init_schema()
+except Exception as e:
+    print("تعذر تهيئة المحرك المضبوط:", e)
 st = db.status()
 if not st["connected"] and st["driver"] == "postgres":
     # CI/آلة بلا خادم PostgreSQL: نُجري نفس الاختبارات على SQLite

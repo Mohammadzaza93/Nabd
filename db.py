@@ -45,6 +45,7 @@ TABLE_COLUMNS = {
     "events": ["ts", "name", "ip", "etype"],
     "samples": ["ts", "name", "rtt", "cpu", "mem", "in_bps",
                 "out_bps", "ports_up", "ports_total"],
+    "sensor_samples": ["ts", "name", "sensor", "value", "state"],
     "alert_acks": ["key", "name", "at"],
     "maintenance": ["name", "until"],
     "maintenance_log": ["name", "started", "ended"],
@@ -111,6 +112,8 @@ class Database:
             "keep_monthly": max(0, int(bk.get("keep_monthly") or 3)),
         }
         self._last_backup = 0.0
+        self._schema_ready = False
+        self._schema_error = ""
 
         # مراقب PostgreSQL: يعيد تشغيل الخادم تلقائياً إذا توقف أثناء العمل
         wd = pg.get("watchdog")
@@ -289,8 +292,11 @@ class Database:
             return 0
 
         def _do(c):
-            with c.cursor() as cur:
+            cur = c.cursor()
+            try:
                 cur.executemany(sql, rows)
+            finally:
+                cur.close()
             if self.driver == "sqlite":
                 c.commit()
             return len(rows)
@@ -307,6 +313,10 @@ class Database:
                     ts REAL NOT NULL, name TEXT NOT NULL, rtt REAL, cpu REAL, mem REAL,
                     in_bps REAL, out_bps REAL, ports_up INTEGER, ports_total INTEGER)""",
                 "CREATE INDEX IF NOT EXISTS idx_samples_name_ts ON samples(name, ts)",
+                """CREATE TABLE IF NOT EXISTS sensor_samples(
+                    ts REAL NOT NULL, name TEXT NOT NULL, sensor TEXT NOT NULL,
+                    value REAL, state TEXT)""",
+                "CREATE INDEX IF NOT EXISTS idx_sensor_name_ts ON sensor_samples(name, sensor, ts)",
                 "CREATE TABLE IF NOT EXISTS alert_acks(key TEXT PRIMARY KEY, name TEXT, at REAL)",
                 "CREATE TABLE IF NOT EXISTS maintenance(name TEXT PRIMARY KEY, until REAL)",
                 """CREATE TABLE IF NOT EXISTS maintenance_log(
@@ -332,6 +342,10 @@ class Database:
                 cpu DOUBLE PRECISION, mem DOUBLE PRECISION, in_bps DOUBLE PRECISION,
                 out_bps DOUBLE PRECISION, ports_up INTEGER, ports_total INTEGER)""",
             "CREATE INDEX IF NOT EXISTS idx_samples_name_ts ON samples(name, ts)",
+            """CREATE TABLE IF NOT EXISTS sensor_samples(
+                ts DOUBLE PRECISION NOT NULL, name TEXT NOT NULL, sensor TEXT NOT NULL,
+                value DOUBLE PRECISION, state TEXT)""",
+            "CREATE INDEX IF NOT EXISTS idx_sensor_name_ts ON sensor_samples(name, sensor, ts)",
             "CREATE TABLE IF NOT EXISTS alert_acks(key TEXT PRIMARY KEY, name TEXT, at DOUBLE PRECISION)",
             "CREATE TABLE IF NOT EXISTS maintenance(name TEXT PRIMARY KEY, until DOUBLE PRECISION)",
             """CREATE TABLE IF NOT EXISTS maintenance_log(
@@ -342,6 +356,24 @@ class Database:
         ]
         for sql in stmts:
             self.query(sql)
+
+    def ensure_schema(self):
+        """ينشئ الجداول مرة واحدة عند جاهزية المحرك، ويعيد المحاولة بعد تعافيه.
+
+        عند بدء التشغيل مع PostgreSQL متوقفاً قد تفشل init_schema؛ وجود هذه
+        الدالة يسمح لمراقب قاعدة البيانات بإكمال الترقية فور عودة الاتصال،
+        بدل أن تظل الجداول الجديدة (مثل sensor_samples) ناقصة.
+        """
+        if self._schema_ready:
+            return True
+        try:
+            self.init_schema()
+        except Exception as e:
+            self._schema_error = str(e)[:300]
+            return False
+        self._schema_ready = True
+        self._schema_error = ""
+        return True
 
     # ------------------------------------------------------------- مراقب PostgreSQL
     def _notify(self, text):
@@ -792,7 +824,10 @@ class Database:
         counts = {}
         try:
             for table, cols in TABLE_COLUMNS.items():
-                rows = src.query("SELECT " + ",".join(cols) + " FROM " + table)
+                try:
+                    rows = src.query("SELECT " + ",".join(cols) + " FROM " + table)
+                except Exception:
+                    continue  # جدول جديد في نسخة حديثة وغير موجود في قاعدة قديمة
                 if not rows:
                     continue
                 marks = ",".join(["%s"] * len(cols))

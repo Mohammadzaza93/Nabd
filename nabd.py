@@ -149,7 +149,8 @@ _DR = DISC.get("router") or {}
 DISC_ON = bool(_DR.get("host")) and bool(_DR.get("password")) and not str(_DR.get("password")).startswith("PUT_")
 
 NOTIF_KEYS = ("device_down", "device_up", "internet", "new_device", "daily_report",
-              "port_down", "high_cpu", "sfp_low")
+              "port_down", "high_cpu", "high_mem", "high_rtt", "sfp_low",
+              "custom_sensor")
 NOTIF = dict(CFG.get("notifications") or {})
 CFG_LOCK = threading.RLock()
 DISCOVER_LOCK = threading.Lock()
@@ -255,6 +256,8 @@ def _normalize_config(cfg):
     snmp["retries"] = _as_int(snmp.get("retries", 1), 1, 0)
     snmp["poll_seconds"] = _as_int(snmp.get("poll_seconds", 60), 60, 10)
     snmp["cpu_warn"] = _as_int(snmp.get("cpu_warn", 85), 85, 1)
+    snmp["mem_warn"] = _as_int(snmp.get("mem_warn", 85), 85, 1)
+    snmp["rtt_warn"] = _as_range(snmp.get("rtt_warn", 200.0), 200.0, 1, 600000)
     snmp["sfp_rx_min"] = _as_range(snmp.get("sfp_rx_min", -20.0), -20.0, -60, 10)
     snmp["history_points"] = _as_int(snmp.get("history_points", 120), 120, 10)
     snmp["alert_cooldown_minutes"] = _as_int(
@@ -484,6 +487,7 @@ def prune_samples():
     cutoff = time.time() - METRICS_KEEP_DAYS * 86400
     try:
         db_exec("DELETE FROM samples WHERE ts < ?", (cutoff,))
+        db_exec("DELETE FROM sensor_samples WHERE ts < ?", (cutoff,))
         db_exec("DELETE FROM alert_acks WHERE at < ?", (cutoff,))
         db_exec("DELETE FROM maintenance WHERE until < ?", (time.time() - 86400,))
         db_exec("DELETE FROM maintenance_log WHERE ended < ?", (cutoff,))
@@ -493,7 +497,9 @@ def prune_samples():
 
 def init_db():
     try:
-        DBM.init_schema()
+        if not DBM.ensure_schema():
+            log(f"تعذر تهيئة قاعدة البيانات: {DBM._schema_error}")
+            return
         prune_events()
         prune_samples()
         log(f"قاعدة البيانات: {DBM.driver} — {DBM.status().get('version', '')}")
@@ -778,6 +784,97 @@ def ack_alert(key, ack=True):
 
 
 # ---------------------------------------------------------------- الأجهزة
+def _dev_num(row, key, default=0.0):
+    try:
+        value = float(str(row.get(key) or "").strip())
+        return value if value == value and abs(value) != float("inf") else default
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_sensors(value, strict=False):
+    """يقرأ مستشعرات SNMP المخصصة من JSON ويتجاهل الإدخالات غير الصالحة.
+
+    في وضع strict يُبلّغ عن الخطأ بدل تجاهله، حتى تظهر رسالة واضحة في اللوحة
+    عندما يُدخل المستخدم OID أو اسماً غير صالحاً.
+    """
+    def bad(message):
+        if strict:
+            raise ValueError(message)
+        log("تنبيه: " + message + " — تم تجاهل المستشعرات غير الصالحة")
+        return []
+
+    def skip(message):
+        if strict:
+            raise ValueError(message)
+        log("تنبيه: " + message + " — تم تجاهل هذا المستشعر")
+
+    if isinstance(value, list):
+        raw = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return []
+        try:
+            raw = json.loads(text)
+        except (TypeError, ValueError):
+            return bad("تعذّر قراءة مستشعرات SNMP (JSON غير صالح)")
+    if not isinstance(raw, list):
+        return bad("مستشعرات SNMP يجب أن تكون قائمة")
+    if len(raw) > 16:
+        skip("عدد المستشعرات يتجاوز 16 — سيُحتفظ بالستة عشر الأولى")
+
+    def number(item, key, default=0.0):
+        value = item.get(key, default)
+        if value is None or str(value).strip() == "":
+            return default
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            skip(f"قيمة غير صالحة في «{key}» للمستشعر: {value}")
+            return default
+        return v if v == v and abs(v) != float("inf") else default
+
+    out, seen = [], set()
+    for index, item in enumerate(raw[:16], 1):
+        if not isinstance(item, dict):
+            skip(f"المستشعر رقم {index} غير صالح")
+            continue
+        oid = str(item.get("oid") or "").strip().strip(".")
+        if not re.fullmatch(r"\d+(?:\.\d+){2,}", oid):
+            skip(f"OID غير صالح في المستشعر رقم {index}: {oid or 'فارغ'}")
+            continue
+        name = str(item.get("name") or "").strip()[:40]
+        if not name:
+            skip(f"اسم المستشعر رقم {index} فارغ")
+            continue
+        if name.lower() in seen:
+            skip(f"اسم المستشعر «{name}» مكرر")
+            continue
+        seen.add(name.lower())
+        out.append({"oid": oid, "name": name,
+                    "unit": str(item.get("unit") or "").strip()[:12],
+                    "warn": number(item, "warn"), "crit": number(item, "crit"),
+                    "scale": number(item, "scale", 1.0) or 1.0,
+                    "low": bool(item.get("low", False))})
+    return out
+
+
+def dev_settings(row):
+    """العتبات الخاصة بالجهاز؛ القيمة الفارغة تعني استخدام الإعداد العام."""
+    def integer(key):
+        value = _dev_num(row, key, None)
+        return None if value is None else int(value)
+
+    return {
+        "cpu_warn": integer("cpu_warn"),
+        "mem_warn": integer("mem_warn"),
+        "rtt_warn": _dev_num(row, "rtt_warn", None),
+        "sfp_rx_min": _dev_num(row, "sfp_rx_min", None),
+        "sensors": parse_sensors(row.get("sensors")),
+    }
+
+
 def make_dev(row):
     return {
         "name": row["name"],
@@ -798,6 +895,7 @@ def make_dev(row):
         "snmp": (row.get("snmp") or "").strip().lower(),
         "snmp_community": (row.get("snmp_community") or "").strip(),
         "profile": (row.get("profile") or "auto").strip().lower() or "auto",
+        "limits": dev_settings(row),
     }
 
 
@@ -839,7 +937,8 @@ def load_devices():
 
 # ---------------------------------------------------------------- إدارة ملف الأجهزة
 CSV_FIELDS = ("name", "ip", "kind", "parent", "group", "snmp",
-              "snmp_community", "profile")
+              "snmp_community", "profile", "cpu_warn", "mem_warn",
+              "rtt_warn", "sfp_rx_min", "sensors")
 CSV_LOCK = threading.RLock()
 
 
@@ -930,8 +1029,38 @@ def normalize_device(data):
         raise ValueError("اسم مجتمع SNMP طويل جداً")
     if parent == name:
         raise ValueError("لا يمكن أن يتبع الجهاز نفسه")
+
+    def threshold(key, label, low, high, as_float=False):
+        raw = str(data.get(key) or "").strip()
+        if not raw:
+            return ""
+        try:
+            value = float(raw) if as_float else int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{label}: اكتب رقماً صحيحاً")
+        if value != value or abs(value) == float("inf"):
+            raise ValueError(f"{label}: قيمة غير صالحة")
+        if not low <= value <= high:
+            raise ValueError(f"{label}: يجب أن يكون بين {low} و {high}")
+        return value
+
+    sensors = parse_sensors(data.get("sensors"), strict=True)
+    for s in sensors:
+        if s["warn"] and s["crit"]:
+            if s["low"] and s["crit"] > s["warn"]:
+                raise ValueError(f"حد الخطر في «{s['name']}» يجب أن يكون أقل من حد التحذير")
+            if not s["low"] and s["crit"] < s["warn"]:
+                raise ValueError(f"حد الخطر في «{s['name']}» يجب أن يكون أكبر من حد التحذير")
+    sensors_text = (json.dumps(sensors, ensure_ascii=False, separators=(",", ":"))
+                    if sensors else "")
+
     return {"name": name, "ip": ip, "kind": kind, "parent": parent, "group": group,
-            "snmp": snmp_mode, "snmp_community": community, "profile": profile}
+            "snmp": snmp_mode, "snmp_community": community, "profile": profile,
+            "cpu_warn": threshold("cpu_warn", "حد CPU", 1, 100),
+            "mem_warn": threshold("mem_warn", "حد الذاكرة", 1, 100),
+            "rtt_warn": threshold("rtt_warn", "حد التأخير", 1, 600000, True),
+            "sfp_rx_min": threshold("sfp_rx_min", "حد SFP", -60, 10, True),
+            "sensors": sensors_text}
 
 
 def add_device(data):
@@ -983,12 +1112,21 @@ def update_device(old_name, data):
         old = DEVS.pop(old_name, None)
         if old and old_name == row["name"] and old["ip"] == row["ip"]:
             old.update({k: row[k] for k in ("kind", "parent", "group")})
+            old["limits"] = dev_settings(row)
             DEVS[row["name"]] = old
         else:
             DEVS[row["name"]] = make_dev(row)
         for d in DEVS.values():
             if d["parent"] == old_name and old_name != row["name"]:
                 d["parent"] = row["name"]
+    if old_name != row["name"]:
+        with SNMP_LOCK:
+            for store in (SNMP_STATE, SNMP_HISTORY, SNMP_PREV):
+                if old_name in store:
+                    store[row["name"]] = store.pop(old_name)
+            for key, when in list(SNMP_ALERTS.items()):
+                if key[1] == old_name:
+                    SNMP_ALERTS[(key[0], row["name"], key[2])] = SNMP_ALERTS.pop(key)
     return row
 
 
@@ -1007,6 +1145,10 @@ def delete_device(name):
         for d in DEVS.values():
             if d["parent"] == name:
                 d["parent"] = ""
+    try:
+        db_exec("DELETE FROM sensor_samples WHERE name=?", (name,))
+    except Exception as e:
+        log(f"تعذر حذف سجل مستشعرات الجهاز {name}: {e}")
 
 
 
@@ -1802,6 +1944,67 @@ def _read_temperature(client, vendor):
     return None
 
 
+def _dev_limit(dev, key, default):
+    """عتبة الجهاز إن وُجدت، وإلا تُستخدم العتبة العامة من الإعدادات."""
+    value = (dev.get("limits") or {}).get(key)
+    return default if value is None else value
+
+
+def _sensor_number(raw, scale=1.0):
+    value = _num(raw)
+    if value is None:
+        match = re.search(r"-?\d+(?:\.\d+)?", str(raw or ""))
+        value = _num(match.group(0)) if match else None
+    if value is None:
+        return None
+    try:
+        return round(float(value) * float(scale or 1.0), 4)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _sensor_state(value, cfg):
+    if not isinstance(value, (int, float)):
+        return "unknown"
+    warn, crit = float(cfg.get("warn") or 0), float(cfg.get("crit") or 0)
+    low = bool(cfg.get("low"))
+    if crit and ((low and value <= crit) or (not low and value >= crit)):
+        return "critical"
+    if warn and ((low and value <= warn) or (not low and value >= warn)):
+        return "warning"
+    return "ok"
+
+
+def _read_custom_sensors(client, sensors):
+    """يقرأ OIDs المعرّفة من المستخدم دفعة واحدة ويحسب حالتها."""
+    if not sensors:
+        return []
+    try:
+        values = client.get([s["oid"] for s in sensors])
+    except (SNMPError, OSError):
+        return []
+    out = []
+    for s in sensors:
+        raw = values.get(s["oid"])
+        if raw is None:
+            raw = values.get("." + s["oid"])
+        value = _sensor_number(raw, s.get("scale"))
+        out.append({"name": s["name"], "oid": s["oid"],
+                    "unit": s.get("unit") or "", "raw": str(raw) if raw is not None else None,
+                    "value": value, "state": _sensor_state(value, s)})
+    return out
+
+
+def _store_sensor_samples(now, name, sensors):
+    rows = [(now, name, s["name"], s["value"], s["state"])
+            for s in sensors if isinstance(s.get("value"), (int, float))]
+    if rows:
+        try:
+            db_execmany("INSERT INTO sensor_samples VALUES (?,?,?,?,?)", rows)
+        except Exception as e:
+            log(f"تعذر حفظ عينات المستشعرات: {e}")
+
+
 def poll_device(name, force=False):
     """يستعلم جهازاً واحداً عبر SNMP ويحدّث الحالة والرسوم والتنبيهات."""
     with LOCK:
@@ -1829,6 +2032,8 @@ def poll_device(name, force=False):
         sfp = _read_optical(client, vendor)
         wifi = _read_wifi(client, vendor)
         temp = _read_temperature(client, vendor)
+        custom_sensors = _read_custom_sensors(
+            client, (dev.get("limits") or {}).get("sensors") or [])
         sysmap["uptime_ticks"] = _num(sysmap.get("uptime"))
         sysmap["uptime_seconds"] = round((sysmap["uptime_ticks"] or 0) / 100) if sysmap.get("uptime_ticks") else None
         sysmap["descr"] = str(descr or "")
@@ -1860,7 +2065,8 @@ def poll_device(name, force=False):
                 port_alerts.append(row)
 
     cpu_hits = int(state_prev.get("cpu_hits") or 0)
-    cpu_warn = _as_int(SNMP.get("cpu_warn", 85), 85, 1)
+    cpu_warn = _dev_limit(dev, "cpu_warn",
+                          _as_int(SNMP.get("cpu_warn", 85), 85, 1))
     if cpu is not None and cpu >= cpu_warn:
         cpu_hits += 1
     else:
@@ -1870,7 +2076,35 @@ def poll_device(name, force=False):
         notify(f"🔥 حمل معالج مرتفع: {name} ({dev['ip']})\n"
                f"CPU: {cpu}% (الحد {cpu_warn}%)\nالوقت: {now_str()}", "high_cpu")
 
-    sfp_min = _as_range(SNMP.get("sfp_rx_min", -20.0), -20.0, -60, 10)
+    mem_pct = (memory or {}).get("pct")
+    mem_hits = int(state_prev.get("mem_hits") or 0)
+    mem_warn = _dev_limit(dev, "mem_warn",
+                          _as_int(SNMP.get("mem_warn", 85), 85, 1))
+    if isinstance(mem_pct, (int, float)) and mem_pct >= mem_warn:
+        mem_hits += 1
+    else:
+        mem_hits = 0
+    if mem_hits >= 2 and not silent and _alert_ready("high_mem", name):
+        log_event(now, name, dev["ip"], "high_mem")
+        notify(f"🧠 استخدام ذاكرة مرتفع: {name} ({dev['ip']})\n"
+               f"الذاكرة: {mem_pct}% (الحد {mem_warn}%)\nالوقت: {now_str()}", "high_mem")
+
+    rtt = dev.get("rtt")
+    rtt_hits = int(state_prev.get("rtt_hits") or 0)
+    rtt_warn = _dev_limit(dev, "rtt_warn",
+                          _as_range(SNMP.get("rtt_warn", 200.0), 200.0, 1, 600000))
+    if isinstance(rtt, (int, float)) and rtt >= rtt_warn:
+        rtt_hits += 1
+    else:
+        rtt_hits = 0
+    if rtt_hits >= 2 and not silent and _alert_ready("high_rtt", name):
+        log_event(now, name, dev["ip"], "high_rtt")
+        notify(f"🐢 تأخير اتصال مرتفع: {name} ({dev['ip']})\n"
+               f"RTT: {round(rtt)} ms (الحد {round(rtt_warn)} ms)\nالوقت: {now_str()}",
+               "high_rtt")
+
+    sfp_min = _dev_limit(dev, "sfp_rx_min",
+                         _as_range(SNMP.get("sfp_rx_min", -20.0), -20.0, -60, 10))
     prev_sfp = {r["name"]: r for r in (state_prev.get("sfp") or [])}
     for row in sfp:
         rx = row.get("rx")
@@ -1884,6 +2118,30 @@ def poll_device(name, force=False):
             notify(f"🔻 ضعف إشارة SFP: {name} ({dev['ip']})\n"
                    f"المنفذ: {row['name']} | الاستقبال: {rx} dBm (الحد {sfp_min} dBm)\n"
                    f"الوقت: {now_str()}", "sfp_low")
+
+    prev_sensors = {r["name"]: r for r in (prev_state.get("sensors") or [])}
+    sensor_alerts = []
+    for row in custom_sensors:
+        before = prev_sensors.get(row["name"]) or {}
+        previous = before.get("state") or "unknown"
+        current = row["state"]
+        if previous == current:
+            continue
+        recovering = previous in ("warning", "critical") and current == "ok"
+        key = ("recovered:" if recovering else "") + row["name"]
+        if silent or not _alert_ready("custom_sensor", name, key):
+            continue
+        shown = row["value"]
+        shown = "—" if shown is None else str(shown) + (row["unit"] or "")
+        label = "✅ عاد مستشعر إلى الوضع الطبيعي" if recovering else "⚠️ تغيّر حالة مستشعر مخصص"
+        sensor_alerts.append((label, row, previous, current, shown))
+        log_event(now, name, dev["ip"], "custom_sensor")
+        notify(f"{label}: {name} ({dev['ip']})\n"
+               f"المستشعر: {row['name']} | القيمة: {shown} | "
+               f"الحالة: {current} (كان {previous})\nالوقت: {now_str()}",
+               "custom_sensor")
+
+    _store_sensor_samples(now, name, custom_sensors)
 
     if port_alerts:
         log_event(now, name, dev["ip"], "port_down")
@@ -1903,17 +2161,24 @@ def poll_device(name, force=False):
     result = {
         "at": now, "ok": True, "error": "",
         "sys": sysmap, "vendor": vendor,
-        "cpu": cpu, "cpu_hits": cpu_hits, "mem": memory, "temp": temp,
+        "cpu": cpu, "cpu_hits": cpu_hits, "mem": memory,
+        "mem_hits": mem_hits, "temp": temp,
         "interfaces": interfaces, "sfp": sfp, "wifi": wifi,
+        "sensors": custom_sensors, "rtt": rtt, "rtt_hits": rtt_hits,
+        "limits": {"cpu_warn": cpu_warn, "mem_warn": mem_warn,
+                   "rtt_warn": rtt_warn, "sfp_rx_min": sfp_min},
         "total": {"in_bps": total_in, "out_bps": total_out},
         "summary": {
-            "at": now, "ok": True, "cpu": cpu, "mem_pct": (memory or {}).get("pct"),
+            "at": now, "ok": True, "cpu": cpu, "mem_pct": mem_pct, "rtt": rtt,
             "temp": temp, "uptime": sysmap.get("uptime_seconds"),
             "sysname": sysmap.get("name") or "",
             "descr": sysmap.get("descr") or "",
             "vendor": vendor,
             "ports": len(interfaces), "ports_up": up_ports,
-            "wifi": len(wifi), "sfp": len(sfp),
+            "wifi": len(wifi), "sfp": len(sfp), "sensors": len(custom_sensors),
+            "sensor_state": ("critical" if any(s["state"] == "critical" for s in custom_sensors)
+                             else "warning" if any(s["state"] == "warning" for s in custom_sensors)
+                             else "ok"),
             "in_bps": total_in, "out_bps": total_out,
             "max_temp": max([r.get("temp") for r in sfp if isinstance(r.get("temp"), (int, float))] or [temp or 0]) or None,
         },
@@ -2025,8 +2290,10 @@ def active_alerts():
         devs = [dict(d) for d in DEVS.values()]
     with SNMP_LOCK:
         states = {n: dict(s) for n, s in SNMP_STATE.items()}
-    cpu_warn = _as_int(SNMP.get("cpu_warn", 85), 85, 1)
-    sfp_min = _as_range(SNMP.get("sfp_rx_min", -20.0), -20.0, -60, 10)
+    global_cpu = _as_int(SNMP.get("cpu_warn", 85), 85, 1)
+    global_mem = _as_int(SNMP.get("mem_warn", 85), 85, 1)
+    global_rtt = _as_range(SNMP.get("rtt_warn", 200.0), 200.0, 1, 600000)
+    global_sfp = _as_range(SNMP.get("sfp_rx_min", -20.0), -20.0, -60, 10)
     alerts = []
 
     def add(key, d, severity, etype, message, since, detail=""):
@@ -2055,11 +2322,25 @@ def active_alerts():
         st = states.get(name)
         if not st or not st.get("ok"):
             continue
+        cpu_warn = _dev_limit(d, "cpu_warn", global_cpu)
+        mem_warn = _dev_limit(d, "mem_warn", global_mem)
+        rtt_warn = _dev_limit(d, "rtt_warn", global_rtt)
+        sfp_min = _dev_limit(d, "sfp_rx_min", global_sfp)
         cpu = st.get("cpu")
         if isinstance(cpu, (int, float)) and cpu >= cpu_warn:
             add("cpu:" + name, d, "warning", "high_cpu",
                 "ارتفاع حمل المعالج", st.get("at") or now,
                 f"CPU: {round(cpu)}% (الحد {cpu_warn}%)")
+        mem_pct = st.get("mem_pct")
+        if isinstance(mem_pct, (int, float)) and mem_pct >= mem_warn:
+            add("mem:" + name, d, "warning", "high_mem",
+                "ارتفاع استخدام الذاكرة", st.get("at") or now,
+                f"الذاكرة: {mem_pct}% (الحد {mem_warn}%)")
+        rtt = d.get("rtt")
+        if isinstance(rtt, (int, float)) and rtt >= rtt_warn:
+            add("rtt:" + name, d, "warning", "high_rtt",
+                "ارتفاع تأخير الاتصال", st.get("at") or now,
+                f"RTT: {round(rtt)} ms (الحد {round(rtt_warn)} ms)")
         down_ports = []
         for r in (st.get("interfaces") or []):
             if (r.get("admin") == 1 and r.get("oper") != 1 and
@@ -2080,6 +2361,16 @@ def active_alerts():
                     "sfp_low", "ضعف إشارة SFP: " + str(r.get("name")),
                     st.get("at") or now,
                     "الاستقبال: " + str(rx) + " dBm (الحد " + str(sfp_min) + " dBm)")
+        for r in (st.get("sensors") or []):
+            if r.get("state") not in ("warning", "critical"):
+                continue
+            shown = r.get("value")
+            shown = "—" if shown is None else str(shown) + (r.get("unit") or "")
+            add("sensor:" + name + ":" + str(r.get("name")), d,
+                "critical" if r.get("state") == "critical" else "warning",
+                "custom_sensor", "مستشعر مخصص: " + str(r.get("name")),
+                st.get("at") or now,
+                f"القيمة: {shown} | الحالة: {r.get('state')}")
 
     order = {"critical": 0, "warning": 1, "info": 2}
     alerts.sort(key=lambda a: (order.get(a["severity"], 9), -a["duration"], a["name"]))
@@ -2171,7 +2462,7 @@ def api_status():
         devs = [
             {k: d[k] for k in ("name", "ip", "kind", "group", "parent", "eff", "rtt",
                                "since", "last_ok", "down_at", "ports", "ports_at",
-                               "snmp", "snmp_community", "profile")}
+                               "snmp", "snmp_community", "profile", "limits")}
             for d in DEVS.values()
         ]
         net = {k: NET[k] for k in ("state", "since", "down_at", "probes", "probes_up", "ready")}
@@ -2465,6 +2756,8 @@ def api_settings():
                 "retries": cfg["snmp"]["retries"],
                 "poll_seconds": cfg["snmp"]["poll_seconds"],
                 "cpu_warn": cfg["snmp"]["cpu_warn"],
+                "mem_warn": cfg["snmp"]["mem_warn"],
+                "rtt_warn": cfg["snmp"]["rtt_warn"],
                 "sfp_rx_min": cfg["snmp"]["sfp_rx_min"],
                 "history_points": cfg["snmp"]["history_points"],
                 "alert_cooldown_minutes": cfg["snmp"]["alert_cooldown_minutes"],
@@ -2620,6 +2913,11 @@ def api_settings():
         sn["poll_seconds"] = _as_int(snmp_in.get("poll_seconds", sn["poll_seconds"]), sn["poll_seconds"], 10)
     if "cpu_warn" in snmp_in:
         sn["cpu_warn"] = min(100, _as_int(snmp_in.get("cpu_warn", sn["cpu_warn"]), sn["cpu_warn"], 1))
+    if "mem_warn" in snmp_in:
+        sn["mem_warn"] = min(100, _as_int(snmp_in.get("mem_warn", sn["mem_warn"]), sn["mem_warn"], 1))
+    if "rtt_warn" in snmp_in:
+        sn["rtt_warn"] = _as_range(snmp_in.get("rtt_warn", sn["rtt_warn"]),
+                                   sn["rtt_warn"], 1, 600000)
     if "sfp_rx_min" in snmp_in:
         sn["sfp_rx_min"] = _as_range(snmp_in.get("sfp_rx_min", sn["sfp_rx_min"]), sn["sfp_rx_min"], -60, 10)
     if "history_points" in snmp_in:
@@ -2880,6 +3178,64 @@ def api_snmp_device(name):
     return jsonify(state)
 
 
+@app.route("/api/snmp/sensors/<name>")
+def api_snmp_sensors(name):
+    rng = request.args.get("range", "24h")
+    if rng not in SAMPLE_RANGES:
+        return jsonify({"ok": False, "error": "مدة غير صالحة"}), 400
+    wanted = request.args.get("sensor", "").strip()[:40]
+    with LOCK:
+        dev = DEVS.get(name)
+    if not dev:
+        return jsonify({"ok": False, "error": "لم أجد الجهاز"}), 404
+    defs = (dev.get("limits") or {}).get("sensors") or []
+    if wanted:
+        defs = [s for s in defs if s["name"] == wanted]
+    with SNMP_LOCK:
+        state = SNMP_STATE.get(name) or {}
+        latest = ({r["name"]: r for r in (state.get("sensors") or [])}
+                  if state.get("ok") else {})
+
+    seconds = SAMPLE_RANGES[rng]
+    step = max(60, int(seconds / 240))
+    since = time.time() - seconds
+    sensors = []
+
+    def sensor_rows(sql, args):
+        try:
+            return db_exec(sql, args)
+        except Exception as e:
+            log(f"تعذر قراءة سجل المستشعرات: {e}")
+            return []
+
+    for cfg in defs:
+        item = dict(cfg)
+        row = latest.get(cfg["name"]) or {}
+        item["value"] = row.get("value")
+        item["state"] = row.get("state") or "unknown"
+        item["at"] = row.get("at") or state.get("at")
+        if item["value"] is None:
+            last = sensor_rows(
+                "SELECT ts,value,state FROM sensor_samples "
+                "WHERE name=? AND sensor=? ORDER BY ts DESC LIMIT 1",
+                (name, cfg["name"]))
+            if last:
+                item["at"], item["value"], item["state"] = last[0], last[1], last[2] or "unknown"
+        points = sensor_rows(
+            """SELECT CAST(ts/? AS INTEGER)*?, AVG(value),
+                      MAX(CASE state WHEN 'critical' THEN 2 WHEN 'warning' THEN 1
+                                     WHEN 'ok' THEN 0 ELSE 3 END)
+               FROM sensor_samples WHERE name=? AND sensor=? AND ts>=?
+               GROUP BY 1 ORDER BY 1""",
+            (step, step, name, cfg["name"], since))
+        item["history"] = [[int(r[0]), None if r[1] is None else round(r[1], 3),
+                            int(r[2] or 0)] for r in points]
+        sensors.append(item)
+    return jsonify({"name": name, "range": rng, "step": step, "since": since,
+                    "at": time.time(), "sensors": sensors,
+                    "snmp_at": state.get("at")})
+
+
 @app.route("/api/snmp/poll", methods=["POST"])
 def api_snmp_poll():
     guard = _write_guard()
@@ -3054,6 +3410,8 @@ def api_db_settings():
 def _db_watchdog_async():
     try:
         DBM.ensure_postgres(force=True)
+        if DBM.ensure_schema():
+            log("تم التحقق من مخطط قاعدة البيانات بعد فحص المراقب.")
     except Exception as e:
         log(f"مراقب قاعدة البيانات: {e}")
 
@@ -3332,7 +3690,8 @@ h2 .muted{font-weight:400}
 .ev-up{color:#9fe6ad;background:rgba(16,52,29,.7);border-color:rgba(63,185,80,.3)}
 .ev-down{color:#ffb4ae;background:rgba(58,22,20,.7);border-color:rgba(248,81,73,.3)}
 .ev-unreachable{color:#f0d48a;background:rgba(52,42,16,.7);border-color:rgba(210,153,34,.3)}
-.ev-sfp_low,.ev-high_cpu,.ev-port_down{color:#f0d48a;background:rgba(52,42,16,.7);border-color:rgba(210,153,34,.3)}
+.ev-sfp_low,.ev-high_cpu,.ev-high_mem,.ev-high_rtt,.ev-port_down{color:#f0d48a;background:rgba(52,42,16,.7);border-color:rgba(210,153,34,.3)}
+.ev-custom_sensor{color:#d2a8ff;background:rgba(72,42,94,.65);border-color:rgba(163,113,247,.35)}
 .ev-new_device,.ev-maintenance_on,.ev-maintenance_off{color:#9ecbff;background:rgba(16,36,58,.7);border-color:rgba(88,166,255,.3)}
 .foot{margin-top:6px;color:var(--dim);font-size:11.5px;text-align:center}
 .acts{display:flex;gap:5px}
@@ -3384,6 +3743,14 @@ h2 .muted{font-weight:400}
 .tabs button:hover{background:rgba(22,35,51,.9);color:var(--tx)}
 .tabs button.active{background:rgba(47,129,247,.18);border-color:rgba(88,166,255,.35);color:#cfe6ff}
 .snmp-pane{min-height:110px;max-height:40vh;overflow:auto;border:1px solid var(--line);border-radius:10px;padding:8px;background:rgba(0,0,0,.16)}
+.sensor-row{border:1px solid var(--line);border-radius:10px;padding:8px;margin-bottom:8px;background:rgba(22,35,51,.55)}
+.sensor-row label{flex:1 1 130px;min-width:110px;font-size:11.5px}
+.sensor-row label.checks{flex:0 0 auto;display:flex;align-items:center;gap:6px;color:var(--tx);font-size:12.5px}
+.sensor-row input{flex:1;min-width:0}
+.sensor-state{display:inline-block;border-radius:99px;padding:2px 9px;font-size:11px;font-weight:700}
+.sensor-state.ok{color:#7ee2a8;background:rgba(46,160,67,.18)}
+.sensor-state.warning{color:#f0d48a;background:rgba(210,153,34,.18)}
+.sensor-state.critical{color:#ff9b95;background:rgba(248,81,73,.18)}
 .snmp-table{width:100%;border-collapse:collapse;font-size:12px;white-space:nowrap}
 .snmp-table th{position:sticky;top:0;background:#141e29;color:#9fb4c8;font-weight:600;text-align:right;padding:6px 8px;border-bottom:1px solid var(--line)}
 .snmp-table td{padding:5px 8px;border-bottom:1px solid rgba(255,255,255,.05);font-variant-numeric:tabular-nums}
@@ -3493,7 +3860,8 @@ h2 .muted{font-weight:400}
 @media(max-width:1180px){.shell{grid-template-columns:210px minmax(0,1fr);gap:15px}.card b{font-size:27px}}
 @media(max-width:980px){.col-group,.col-parent{display:none}}
 @media(max-width:900px){
-  .shell{display:flex;flex-direction:column}
+  .shell{display:flex;flex-direction:column;align-items:stretch}
+  .main{width:100%}
   .views{position:static;width:100%;flex-direction:row;overflow-x:auto;padding:7px;gap:5px;
     scrollbar-width:none}.views::-webkit-scrollbar{display:none}
   .views button{width:auto;white-space:nowrap;padding:8px 13px}
@@ -3693,7 +4061,10 @@ h2 .muted{font-weight:400}
         <option value="new_device">جهاز جديد</option>
         <option value="port_down">سقوط منفذ</option>
         <option value="high_cpu">ارتفاع CPU</option>
+        <option value="high_mem">ارتفاع الذاكرة</option>
+        <option value="high_rtt">ارتفاع التأخير</option>
         <option value="sfp_low">ضعف SFP</option>
+        <option value="custom_sensor">مستشعر مخصص</option>
         <option value="maintenance_on">بدء صيانة</option>
         <option value="maintenance_off">انتهاء صيانة</option>
       </select>
@@ -3803,6 +4174,24 @@ h2 .muted{font-weight:400}
       </label>
     </div>
     <label>مجتمع SNMP خاص بهذا الجهاز (اختياري)<input id="f-community" maxlength="64" autocomplete="off" placeholder="اتركه فارغاً لاستخدام المجتمع العام"></label>
+    <details id="f-limits-box">
+      <summary>عتبات التنبيه لهذا الجهاز (اختياري)</summary>
+      <div class="grid2">
+        <label>حد CPU (%)<input id="f-cpu-warn" type="number" min="1" max="100" placeholder="افتراضي"></label>
+        <label>حد الذاكرة (%)<input id="f-mem-warn" type="number" min="1" max="100" placeholder="افتراضي"></label>
+        <label>حد التأخير (ms)<input id="f-rtt-warn" type="number" min="1" max="600000" placeholder="افتراضي"></label>
+        <label>حد ضعف SFP (dBm)<input id="f-sfp-min" type="number" min="-60" max="10" step="0.5" placeholder="افتراضي"></label>
+      </div>
+      <div class="hint">اترك أي حقل فارغاً لاستخدام الحد العام من الإعدادات.</div>
+    </details>
+    <details id="f-sensors-box">
+      <summary>مستشعرات SNMP مخصصة (حتى 16 مستشعراً)</summary>
+      <div id="f-sensors"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn mini" id="f-sensor-add">＋ إضافة مستشعر</button>
+      </div>
+      <div class="hint">اكتب OID كاملاً مثل 1.3.6.1.4.1.14988.1.1.3.10.0. حدّدا التحذير والخطر بالوحدة بعد الضرب في معامل Scale، وفعّل «قيمة منخفضة خطرة» لدرجات الحرارة السالبة أو قوة الإشارة.</div>
+    </details>
     <datalist id="dl-kinds">
       <option value="router"></option><option value="internet"></option><option value="isp"></option>
       <option value="switch"></option><option value="dvr"></option><option value="camera"></option>
@@ -3845,7 +4234,10 @@ h2 .muted{font-weight:400}
         <label><input type="checkbox" id="n-daily_report"> التقرير اليومي</label>
         <label><input type="checkbox" id="n-port_down"> سقوط منفذ</label>
         <label><input type="checkbox" id="n-high_cpu"> ارتفاع CPU</label>
+        <label><input type="checkbox" id="n-high_mem"> ارتفاع الذاكرة</label>
+        <label><input type="checkbox" id="n-high_rtt"> ارتفاع التأخير</label>
         <label><input type="checkbox" id="n-sfp_low"> ضعف إشارة SFP</label>
+        <label><input type="checkbox" id="n-custom_sensor"> مستشعر مخصص</label>
       </div>
       <div class="hint">تُطبَّق الاختيارات فوراً على كل الإشعارات القادمة.</div>
     </div>
@@ -3897,6 +4289,8 @@ h2 .muted{font-weight:400}
         <label>المهلة (ثانية)<input id="s-snmp-timeout" type="number" min="0.2" max="15" step="0.1"></label>
         <label>عدد المحاولات<input id="s-snmp-retries" type="number" min="0" max="5"></label>
         <label>حد تنبيه CPU (%)<input id="s-snmp-cpu" type="number" min="1" max="100"></label>
+        <label>حد تنبيه الذاكرة (%)<input id="s-snmp-mem" type="number" min="1" max="100"></label>
+        <label>حد تنبيه التأخير (ms)<input id="s-snmp-rtt" type="number" min="1" max="600000" step="1"></label>
         <label>حد ضعف SFP (dBm)<input id="s-snmp-sfp" type="number" min="-60" max="10" step="0.5"></label>
         <label>نقاط رسم الحركة<input id="s-snmp-history" type="number" min="10" max="1440"></label>
         <label>تبريد التنبيه (دقيقة)<input id="s-snmp-cooldown" type="number" min="0" max="1440"></label>
@@ -3971,7 +4365,10 @@ h2 .muted{font-weight:400}
           <option value="daily_report">التقرير اليومي</option>
           <option value="port_down">سقوط منفذ</option>
           <option value="high_cpu">ارتفاع CPU</option>
+          <option value="high_mem">ارتفاع الذاكرة</option>
+          <option value="high_rtt">ارتفاع التأخير</option>
           <option value="sfp_low">ضعف إشارة SFP</option>
+          <option value="custom_sensor">مستشعر مخصص</option>
         </select>
       </label>
       <div class="hint">يُرسل الطلب JSON مع ترويسات X-Nabd-Event وX-Nabd-Signature (HMAC-SHA256 عند وجود مفتاح سري). يعمل مع تيليجرام والبريد معاً.</div>
@@ -4038,6 +4435,7 @@ h2 .muted{font-weight:400}
         <button type="button" data-tab="ports">المنافذ</button>
         <button type="button" data-tab="sfp">SFP الضوئي</button>
         <button type="button" data-tab="wifi">اللاسلكي</button>
+        <button type="button" data-tab="sensors">مستشعراتي</button>
         <button type="button" data-tab="traffic">الحركة</button>
       </div>
       <div id="det-pane" class="snmp-pane"><span class="hint">جارٍ جلب بيانات SNMP…</span></div>
@@ -4096,9 +4494,11 @@ const LBL = {up:"يعمل", down:"متوقف", unreachable:"لا يمكن الو
 const ORD = {down:0, unreachable:1, unknown:2, up:3};
 const EVC = {down:"سقط", up:"رجع", unreachable:"تعذر الوصول (جهاز أعلى متوقف)",
   new_device:"جهاز جديد", port_down:"سقط منفذ", high_cpu:"ارتفاع CPU",
-  sfp_low:"ضعف إشارة SFP", maintenance_on:"بدأت الصيانة", maintenance_off:"انتهت الصيانة"};
+  high_mem:"ارتفاع الذاكرة", high_rtt:"ارتفاع التأخير", sfp_low:"ضعف إشارة SFP",
+  custom_sensor:"مستشعر مخصص", maintenance_on:"بدأت الصيانة", maintenance_off:"انتهت الصيانة"};
 const EVI = {down:"🔴", up:"🟢", unreachable:"🟠", new_device:"🆕", port_down:"🔌",
-  high_cpu:"🔥", sfp_low:"🔻", maintenance_on:"🛠", maintenance_off:"✅"};
+  high_cpu:"🔥", high_mem:"🧠", high_rtt:"🐢", sfp_low:"🔻",
+  custom_sensor:"📟", maintenance_on:"🛠", maintenance_off:"✅"};
 const SKEY = "nabd.ui.v2";
 
 const state = {q:"", group:"", filter:"all", sort:"status", paused:false,
@@ -4107,6 +4507,7 @@ const state = {q:"", group:"", filter:"all", sort:"status", paused:false,
                detailSnmp:null, detailTab:"system", detailSnmpAt:0, detailSnmpBusy:false,
                view:"devices", reportRange:"24h", report:null, reportBusy:false,
                detailRange:"24h", detailMetrics:null, detailMetricsRange:"",
+               sensorDetail:null, sensorRange:"24h", sensorBusy:false,
                mapPos:{}, mapView:null, mapDragging:false, maintName:null,
                mapLayout:null, alerts:null, alertsAt:0, alertCounts:null,
                alertMaint:[], reportAt:0, mapQ:"", mapStatus:"all", mapGroup:"",
@@ -4484,6 +4885,12 @@ $("pause").addEventListener("click", () => setPaused(!state.paused));
 $("add").addEventListener("click", () => openForm(null));
 $("dcancel").addEventListener("click", () => $("dlg").close());
 $("df").addEventListener("submit", saveDevice);
+$("f-sensor-add").addEventListener("click", () => {
+  const row = sensorRow({});
+  $("f-sensors").appendChild(row);
+  const first = row.querySelector("input");
+  if (first) first.focus();
+});
 $("tb").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-action]");
   if (!b) return;
@@ -4512,6 +4919,56 @@ function setFormError(msg){
   if (msg){ e.hidden = false; e.textContent = msg; }
   else { e.hidden = true; e.textContent = ""; }
 }
+function sensorRow(s){
+  const row = mk("div", "sensor-row");
+  const fields = [
+    ["oid", "OID", "text", "1.3.6.1.4.1..."],
+    ["name", "الاسم", "text", "مثال: temperature"],
+    ["unit", "الوحدة", "text", "C / % / dBm"],
+    ["warn", "تحذير", "number", "0"],
+    ["crit", "خطر", "number", "0"],
+    ["scale", "Scale", "number", "1"]
+  ];
+  for (const [key, label, type, placeholder] of fields){
+    const lab = mk("label", "", label);
+    const input = document.createElement("input");
+    input.type = type;
+    input.dataset.field = key;
+    input.placeholder = placeholder;
+    input.value = (s && s[key] != null) ? s[key] : "";
+    if (type === "number") input.step = "any";
+    if (key === "oid") input.dir = "ltr";
+    lab.appendChild(input);
+    row.appendChild(lab);
+  }
+  const low = mk("label", "checks");
+  const check = document.createElement("input");
+  check.type = "checkbox";
+  check.dataset.field = "low";
+  check.checked = !!(s && s.low);
+  low.append(check, document.createTextNode(" قيمة منخفضة خطرة"));
+  row.appendChild(low);
+  const del = mk("button", "btn mini ghost", "✕");
+  del.type = "button";
+  del.title = "إزالة المستشعر";
+  del.addEventListener("click", () => row.remove());
+  row.appendChild(del);
+  return row;
+}
+function renderSensorRows(list){
+  const rows = (list && list.length) ? list : [{}];
+  $("f-sensors").replaceChildren(...rows.map(sensorRow));
+}
+function collectSensors(){
+  return Array.from($("f-sensors").children).map(row => {
+    const item = {};
+    for (const input of row.querySelectorAll("[data-field]")){
+      item[input.dataset.field] = input.type === "checkbox"
+        ? input.checked : input.value.trim();
+    }
+    return item;
+  }).filter(x => x.oid || x.name);
+}
 function openForm(dev){
   state.editing = dev ? dev.name : null;
   $("dtitle").textContent = dev ? "تعديل جهاز" : "إضافة جهاز";
@@ -4523,6 +4980,12 @@ function openForm(dev){
   $("f-snmp").value = dev ? (dev.snmp || "auto") : "auto";
   $("f-profile").value = dev ? (dev.profile || "auto") : "auto";
   $("f-community").value = dev ? (dev.snmp_community || "") : "";
+  const lim = (dev && dev.limits) || {};
+  $("f-cpu-warn").value = lim.cpu_warn ?? "";
+  $("f-mem-warn").value = lim.mem_warn ?? "";
+  $("f-rtt-warn").value = lim.rtt_warn ?? "";
+  $("f-sfp-min").value = lim.sfp_rx_min ?? "";
+  renderSensorRows(lim.sensors || []);
   setFormError("");
   const ds = (state.data && state.data.devices) || [];
   fillList("dl-groups", Array.from(new Set(ds.map(x => x.group).filter(Boolean))).sort());
@@ -4540,7 +5003,12 @@ async function saveDevice(ev){
     parent: $("f-parent").value.trim(),
     snmp: $("f-snmp").value,
     profile: $("f-profile").value,
-    snmp_community: $("f-community").value.trim()
+    snmp_community: $("f-community").value.trim(),
+    cpu_warn: $("f-cpu-warn").value.trim(),
+    mem_warn: $("f-mem-warn").value.trim(),
+    rtt_warn: $("f-rtt-warn").value.trim(),
+    sfp_rx_min: $("f-sfp-min").value.trim(),
+    sensors: collectSensors()
   };
   if (!body.name || !body.ip){ setFormError("الاسم والعنوان مطلوبان"); return; }
   const btn = ev.submitter || $("df").querySelector("button[type=submit]");
@@ -4818,7 +5286,8 @@ async function dbMigrate(){
 /* ---------------- الإعدادات ---------------- */
 const NOTIF_IDS = {device_down:"n-device_down", device_up:"n-device_up",
   internet:"n-internet", new_device:"n-new_device", daily_report:"n-daily_report",
-  port_down:"n-port_down", high_cpu:"n-high_cpu", sfp_low:"n-sfp_low"};
+  port_down:"n-port_down", high_cpu:"n-high_cpu", high_mem:"n-high_mem",
+  high_rtt:"n-high_rtt", sfp_low:"n-sfp_low", custom_sensor:"n-custom_sensor"};
 
 async function openSettings(){
   msg("s-msg", "");
@@ -4871,6 +5340,8 @@ async function openSettings(){
     $("s-snmp-timeout").value = sn.timeout ?? 1.5;
     $("s-snmp-retries").value = sn.retries ?? 1;
     $("s-snmp-cpu").value = sn.cpu_warn ?? 85;
+    $("s-snmp-mem").value = sn.mem_warn ?? 85;
+    $("s-snmp-rtt").value = sn.rtt_warn ?? 200;
     $("s-snmp-sfp").value = sn.sfp_rx_min ?? -20;
     $("s-snmp-history").value = sn.history_points ?? 120;
     $("s-snmp-cooldown").value = sn.alert_cooldown_minutes ?? 30;
@@ -4958,6 +5429,8 @@ async function saveSettings(ev){
       timeout: Number($("s-snmp-timeout").value) || 1.5,
       retries: Number($("s-snmp-retries").value) || 0,
       cpu_warn: Number($("s-snmp-cpu").value) || 85,
+      mem_warn: Number($("s-snmp-mem").value) || 85,
+      rtt_warn: Number($("s-snmp-rtt").value) || 200,
       sfp_rx_min: Number($("s-snmp-sfp").value || -20),
       history_points: Number($("s-snmp-history").value) || 120,
       alert_cooldown_minutes: Number($("s-snmp-cooldown").value) || 0
@@ -5266,6 +5739,10 @@ function renderSnmpPane(){
     renderTrafficPane(pane, s || {});
     return;
   }
+  if (tab === "sensors"){
+    renderSensorPane(pane);
+    return;
+  }
   if (!s){
     pane.appendChild(mk("span", "hint", "لا توجد بيانات SNMP بعد. اضغط «استعلام SNMP الآن»."));
     return;
@@ -5276,14 +5753,17 @@ function renderSnmpPane(){
     if (!(s.interfaces && s.interfaces.length) && !(s.sfp && s.sfp.length)) return;
   }
   if (tab === "system"){
-    const sys = s.sys || {}, mem = s.mem || {};
+    const sys = s.sys || {}, mem = s.mem || {}, lim = s.limits || {};
+    const cpuWarn = lim.cpu_warn || 85, memWarn = lim.mem_warn || 85;
     const grid = mk("div", "metrics");
     grid.append(
       metricCard("المعالج (CPU)", s.cpu == null ? "—" : Math.round(s.cpu) + "%",
-        s.cpu == null ? "غير متاح" : (s.cpu >= 85 ? "مرتفع" : "طبيعي")),
+        s.cpu == null ? "غير متاح" : (s.cpu >= cpuWarn ? "مرتفع" : "طبيعي")),
       metricCard("الذاكرة", mem.pct == null ? "—" : mem.pct + "%",
         mem.total ? fmtBytes(mem.used) + " من " + fmtBytes(mem.total) : "غير متاحة",
-        mem.pct, mem.pct >= 90 ? "bad" : (mem.pct >= 75 ? "mid" : "")),
+        mem.pct, mem.pct >= memWarn ? "bad" : (mem.pct >= memWarn * 0.88 ? "mid" : "")),
+      metricCard("التأخير", s.rtt == null ? "—" : Math.round(s.rtt) + " ms",
+        "الحد " + Math.round(lim.rtt_warn || 200) + " ms"),
       metricCard("الحرارة", s.temp == null ? "—" : Math.round(s.temp) + "°",
         s.temp >= 70 ? "مرتفعة" : "طبيعية"),
       metricCard("مدة التشغيل", sys.uptime_seconds ? fmtDur(sys.uptime_seconds) : "—", "منذ آخر إقلاع"),
@@ -5409,13 +5889,17 @@ function drawHistoryChart(points, defs, title){
     return wrap;
   }
   const W = 680, H = 210, L = 66, R = 12, T = 12, B = 26;
-  let max = 1;
+  let max = 1, min = 0;
   for (const p of rows) for (const d of defs){
     const v = Number(p[d.idx]);
-    if (!isNaN(v) && v > max) max = v;
+    if (isNaN(v)) continue;
+    if (v > max) max = v;
+    if (v < min) min = v;
   }
+  if (max === min) { max += 1; min -= 1; }
+  const vspan = max - min;
   const x = i => L + i * (W - L - R) / Math.max(1, rows.length - 1);
-  const y = v => T + (1 - (Number(v) || 0) / max) * (H - T - B);
+  const y = v => T + (1 - (Number(v) - min) / vspan) * (H - T - B);
   const svg = svgNode("svg", {viewBox: `0 0 ${W} ${H}`, class: "chart", role: "img",
     "aria-label": title || "رسم بياني"});
   for (let i = 0; i <= 4; i++){
@@ -5424,7 +5908,7 @@ function drawHistoryChart(points, defs, title){
       stroke: "rgba(255,255,255,.08)", "stroke-width": 1}));
     const lb = svgNode("text", {x: L - 8, y: gy + 4, fill: "#8b98a5",
       "font-size": 11, "text-anchor": "end"});
-    lb.textContent = defs[0].fmt(Math.round(max * (1 - i / 4)));
+    lb.textContent = defs[0].fmt(Math.round(min + vspan * (1 - i / 4)));
     svg.appendChild(lb);
   }
   for (const d of defs){
@@ -5519,6 +6003,81 @@ async function loadDetailMetrics(){
     if (b) b.replaceChildren(mk("div", "msg bad", "تعذر جلب السجل التاريخي"));
   }
 }
+async function loadSensorDetail(name){
+  if (!name || state.sensorBusy) return;
+  state.sensorBusy = true;
+  const box = $("det-sensor-box");
+  if (box) box.replaceChildren(mk("div", "hint", "جارٍ تحميل المستشعرات…"));
+  try {
+    const r = await fetch("/api/snmp/sensors/" + encodeURIComponent(name) +
+      "?range=" + encodeURIComponent(state.sensorRange), {cache: "no-store"});
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    if (state.detailName !== name || state.detailTab !== "sensors") return;
+    state.sensorDetail = j;
+    renderSensorPane();
+  } catch (e) {
+    const b = $("det-sensor-box");
+    if (b) b.replaceChildren(mk("div", "msg bad", "تعذر جلب المستشعرات: " + e.message));
+  } finally { state.sensorBusy = false; }
+}
+function renderSensorPane(pane){
+  pane = pane || $("det-pane");
+  pane.replaceChildren();
+  const bar = mk("div", "rangebar");
+  for (const [key, label] of [["1h", "ساعة"], ["6h", "6 ساعات"],
+                              ["24h", "24 ساعة"], ["7d", "7 أيام"], ["30d", "30 يوماً"]]){
+    const b = mk("button", state.sensorRange === key ? "active" : "", label);
+    b.type = "button";
+    b.addEventListener("click", () => {
+      state.sensorRange = key;
+      state.sensorDetail = null;
+      renderSensorPane();
+    });
+    bar.appendChild(b);
+  }
+  pane.appendChild(bar);
+  const box = mk("div");
+  box.id = "det-sensor-box";
+  pane.appendChild(box);
+  const j = state.sensorDetail;
+  if (!j){
+    box.appendChild(mk("div", "hint", "جارٍ تحميل المستشعرات…"));
+    loadSensorDetail(state.detailName);
+    return;
+  }
+  const defs = j.sensors || [];
+  if (!defs.length){
+    box.appendChild(mk("div", "hint",
+      "لا توجد مستشعرات مخصصة لهذا الجهاز. أضفها من زر «تعديل» في قائمة الأجهزة."));
+    return;
+  }
+  const grid = mk("div", "metrics");
+  for (const s of defs){
+    const card = mk("div", "metric");
+    card.appendChild(mk("span", "k", s.name));
+    const value = s.value == null ? "—" : s.value + (s.unit || "");
+    card.appendChild(mk("b", "", value));
+    card.appendChild(mk("span", "sensor-state " + (s.state || "unknown"),
+      s.state === "ok" ? "طبيعي" : s.state === "warning" ? "تحذير" :
+      s.state === "critical" ? "خطر" : "غير معروف"));
+    card.appendChild(mk("small", "", " OID: " + s.oid));
+    grid.appendChild(card);
+  }
+  box.appendChild(grid);
+  const charts = mk("div", "chart-split");
+  for (const s of defs){
+    if ((s.history || []).length < 2) continue;
+    charts.appendChild(drawHistoryChart(
+      s.history.map(p => [p[0], p[1]]),
+      [{idx: 1, label: s.name, color: "#a371f7",
+        fmt: v => v + (s.unit || "")}],
+      "سجل " + s.name));
+  }
+  if (charts.children.length) box.appendChild(charts);
+  box.appendChild(mk("div", "hint",
+    "القياسات محفوظة في قاعدة البيانات ·خطوة التجميع " + (j.step || 60) + " ثانية"));
+}
 function setDetailTab(tab){
   state.detailTab = tab;
   renderSnmpPane();
@@ -5609,6 +6168,7 @@ function openDetail(name){
   }
   renderPorts($("det-ports"), d.ports, d.ports_at);
   state.detailSnmp = null;
+  state.sensorDetail = null;
   state.detailTab = "system";
   $("det-snmp-at").textContent = "";
   setDetailTab("system");
@@ -6858,7 +7418,10 @@ def render_config(cfg):
         f"  daily_report: {str(nots['daily_report']).lower()}",
         f"  port_down: {str(nots['port_down']).lower()}",
         f"  high_cpu: {str(nots['high_cpu']).lower()}",
+        f"  high_mem: {str(nots['high_mem']).lower()}",
+        f"  high_rtt: {str(nots['high_rtt']).lower()}",
         f"  sfp_low: {str(nots['sfp_low']).lower()}",
+        f"  custom_sensor: {str(nots['custom_sensor']).lower()}",
         "",
         f"check_interval: {cfg['check_interval']}     # فحص كل كم ثانية",
         f"fail_threshold: {cfg['fail_threshold']}      # عدد الفشل المتتالي قبل اعتبار الجهاز متوقفاً",
@@ -6885,6 +7448,8 @@ def render_config(cfg):
         f"  poll_seconds: {cfg['snmp']['poll_seconds']}   # كل كم ثانية يُستعلم عن الأجهزة",
         f"  history_points: {cfg['snmp']['history_points']}   # عدد نقاط رسم الحركة في الذاكرة",
         f"  cpu_warn: {cfg['snmp']['cpu_warn']}   # نسبة CPU التي تُطلق تنبيهاً",
+        f"  mem_warn: {cfg['snmp']['mem_warn']}   # نسبة الذاكرة التي تُطلق تنبيهاً",
+        f"  rtt_warn: {cfg['snmp']['rtt_warn']}   # تأخير الاتصال (ms) الذي يُطلق تنبيهاً",
         f"  sfp_rx_min: {cfg['snmp']['sfp_rx_min']}   # حد إنذار ضعف استقبال SFP (dBm)",
         f"  alert_cooldown_minutes: {cfg['snmp']['alert_cooldown_minutes']}   # منع تكرار نفس التنبيه",
         "",
@@ -7219,6 +7784,7 @@ def db_watchdog_loop():
         try:
             if DBM.watchdog["enabled"] and DBM.driver == "postgres":
                 DBM.ensure_postgres()
+                DBM.ensure_schema()
         except Exception as e:
             log(f"مراقب قاعدة البيانات: {e}")
         time.sleep(max(5, DBM.watchdog["interval"]))
