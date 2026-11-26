@@ -1,0 +1,20 @@
+# نبض بحاوية واحدة بلا PostgreSQL — مناسب للاختبار أو جهاز واحد.
+# التشغيل: docker compose -f docker-compose.sqlite.yml up -d --build
+# لا يحتاج ملف .env وكل البيانات (config.yaml + devices.csv + nabd.db + backups)
+# تبقى في مجلد دائم واحد.
+services:
+  nabd:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${NABD_PORT:-8080}:8080"
+    environment:
+      NABD_SEED_DB_DRIVER: sqlite
+      NABD_TELEGRAM_TOKEN: ${NABD_TELEGRAM_TOKEN:-}
+      NABD_DASH_PASSWORD: ${NABD_DASH_PASSWORD:-}
+      NABD_SMTP_PASSWORD: ${NABD_SMTP_PASSWORD:-}
+    volumes:
+      - nabdsqlite:/data
+
+volumes:
+  nabdsqlite:

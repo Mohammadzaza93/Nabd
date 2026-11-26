@@ -12,6 +12,7 @@ config.yaml
 devices.csv
 .env
 .env.*
+!.env.example
 
 # قاعدة بيانات التشغيل والنسخ الاحتياطية (تُنشأ تلقائياً)
 nabd.db

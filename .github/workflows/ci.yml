@@ -23,7 +23,7 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Syntax check
-        run: python -m py_compile nabd.py snmp.py db.py discover.py
+        run: python -m py_compile nabd.py snmp.py db.py discover.py docker_entrypoint.py
 
       - name: SNMP client test (local fake agent)
         run: python tests/test_snmp.py
@@ -33,3 +33,11 @@ jobs:
 
       - name: Deeper monitoring test (thresholds and custom sensors)
         run: python tests/test_monitor.py
+
+      - name: Docker entrypoint test (config seeding, no daemon needed)
+        run: python tests/test_docker_entrypoint.py
+
+      - name: Validate compose files
+        run: |
+          POSTGRES_PASSWORD=ci-test docker compose config --quiet
+          docker compose -f docker-compose.sqlite.yml config --quiet

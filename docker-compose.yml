@@ -1,0 +1,47 @@
+# نبض — نشر جاهز: تطبيق عربي + PostgreSQL مجاني + نسخ احتياطية محلية
+# انسخ .env.example إلى .env وغيّر POSTGRES_PASSWORD قبل أول تشغيل.
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-nabd}
+      POSTGRES_USER: ${POSTGRES_USER:-nabd}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nabd} -d ${POSTGRES_DB:-nabd}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    # لا يُنشر منفذ 5432 على المضيف افتراضياً؛ التطبيق يتصل به عبر شبكة compose.
+
+  nabd:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${NABD_PORT:-8080}:8080"
+    environment:
+      # تُستخدم مرة واحدة فقط لإنشاء config.yaml عند أول تشغيل
+      NABD_SEED_DB_DRIVER: postgres
+      NABD_SEED_PG_HOST: db
+      NABD_SEED_PG_PORT: 5432
+      NABD_SEED_PG_DATABASE: ${POSTGRES_DB:-nabd}
+      NABD_SEED_PG_USER: ${POSTGRES_USER:-nabd}
+      NABD_SEED_PG_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      # أسرار اختيارية مدعومة أصلاً في نبض (لا تُكتب في config.yaml)
+      NABD_TELEGRAM_TOKEN: ${NABD_TELEGRAM_TOKEN:-}
+      NABD_DASH_PASSWORD: ${NABD_DASH_PASSWORD:-}
+      NABD_SMTP_PASSWORD: ${NABD_SMTP_PASSWORD:-}
+    volumes:
+      # config.yaml + devices.csv + nabd.db + backups/
+      - nabddata:/data
+
+volumes:
+  pgdata:
+  nabddata:

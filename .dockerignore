@@ -1,0 +1,20 @@
+.git
+.github
+**/__pycache__/
+*.py[cod]
+*.log
+.env
+.env.*
+!.env.example
+
+# بيانات خاصة بجهازك — تُنشأ داخل مجلد البيانات /data
+config.yaml
+config.yaml.bak-*
+devices.csv
+nabd.db
+nabd.db-shm
+nabd.db-wal
+backups/
+
+tests/
+page-check.js
